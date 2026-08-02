@@ -1,3 +1,6 @@
+# Original work credit goes to [balapriyac](https://github.com/balapriyac)
+## This is an attempt at enhancing the scripts from [balapriyac/data-science-tuotrials/useful-python-scripts-eda](https://github.com/balapriyac/data-science-tutorials/tree/main/useful-python-scripts-eda) after running into some limitations while using them in my own EDA workflow.
+
 # 5 Useful Python Scripts for Data Exploration
 
 Automate exploratory data analysis with these 5 comprehensive Python scripts that save hours of manual work.
