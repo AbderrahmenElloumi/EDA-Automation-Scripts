@@ -5,27 +5,21 @@ Analyzes patterns in missing data, classifies missingness mechanisms,
 and provides visualization, imputation recommendations, and actual
 imputation.
 
-Fixes applied vs. the original version:
-- STATISTICAL BUG: `classify_missingness_type` ran up to 10 separate
-  hypothesis tests (t-tests / chi-square tests) per column with no
-  correction for multiple comparisons, inflating the false-positive
-  rate for "this column is MAR" conclusions. Now applies a Bonferroni
-  correction to the significance threshold.
-- The MCAR/MNAR heuristic was a bare "missing_pct < 5% => MCAR" rule
-  with no statistical grounding. It's now clearly labeled as a
-  heuristic (not a real Little's MCAR test) and documents that
-  limitation instead of presenting it as a definitive classification.
-- `recommend_strategy` only ever returned a *string* recommendation —
-  no imputation was actually implemented anywhere in the script.
-  Added `apply_recommended_imputation()` that performs mean/median/mode/
-  predictive imputation matching the recommendation.
-- Added CLI support + headless plot saving via the shared helper.
+Fixes applied vs. the original version (see also eda_common.py):
+- STATISTICAL BUG: `classify_missingness_type` ran up to 10 hypothesis
+  tests per column with no correction for multiple comparisons. Now
+  applies a Bonferroni correction to the significance threshold.
+- The MCAR/MNAR heuristic is now clearly labeled as a heuristic (not a
+  formal Little's MCAR test), instead of presenting it as definitive.
+- Added `apply_recommended_imputation()` — the original script only
+  ever printed a text *recommendation*, nothing was actually imputed.
+- BUG FIX (visual): heatmap/bar plots now use `constrained_layout=True`.
+- Multi-format input and split plots/ vs reports/ output directories.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +30,7 @@ from eda_common import (
     build_base_arg_parser,
     finalize_plot,
     get_logger,
+    get_output_dirs,
     load_dataframe,
     use_headless_backend_if_needed,
 )
@@ -102,16 +97,13 @@ class MissingDataAnalyzer:
                                    alpha: float = 0.05) -> Dict:
         """Classify the likely missingness mechanism for a column.
 
-        IMPORTANT (documented limitation, previously not disclosed):
-        this is a heuristic, not a formal test like Little's MCAR test.
+        This is a heuristic, not a formal test like Little's MCAR test.
         It looks for statistical association between "is this value
         missing" and other observed variables (evidence of MAR); absence
-        of such evidence is treated as weak evidence for MCAR, not proof.
+        of such evidence is weak evidence for MCAR, not proof.
 
-        FIX: the original ran up to 10 hypothesis tests per column without
-        correcting for multiple comparisons, which inflates the chance of
-        a spurious "significant" result. A Bonferroni correction is now
-        applied: alpha_per_test = alpha / n_tests.
+        A Bonferroni correction is applied across the multiple hypothesis
+        tests run per column (alpha_per_test = alpha / n_tests).
         """
         if column not in self.df.columns:
             raise ValueError(f"Column '{column}' not found")
@@ -127,8 +119,6 @@ class MissingDataAnalyzer:
                              if c != column and self.df[c].notna().sum() > 0]
         test_columns = test_columns[:10]
 
-        # FIX: Bonferroni-corrected per-test alpha instead of using the raw
-        # 0.05 threshold for every one of up to 10 tests.
         n_tests = max(len(test_columns), 1)
         alpha_corrected = alpha / n_tests
 
@@ -156,8 +146,6 @@ class MissingDataAnalyzer:
             confidence = "High" if len(mar_evidence) >= 3 else "Medium"
             related_vars = [c for c, _ in mar_evidence[:5]]
         else:
-            # FIX: explicitly label this branch as a heuristic guess, since
-            # "no MAR evidence found" is not proof of MCAR.
             if missing_count / len(self.df) < 0.05:
                 missingness_type = "Possibly MCAR (heuristic: low missing rate, no MAR evidence)"
             else:
@@ -188,21 +176,10 @@ class MissingDataAnalyzer:
             return "mean_median" if pd.api.types.is_numeric_dtype(dtype) else "mode"
         elif "MAR" in miss_type:
             return "predictive"
-        return "flag_mnar"  # MNAR: no safe automatic fix, flag for manual review
+        return "flag_mnar"
 
-    # FIX: new — the original script only ever printed a text recommendation;
-    # nothing actually imputed the data.
     def apply_recommended_imputation(self, column: str) -> Tuple[pd.Series, str]:
-        """Apply the recommended strategy and return (imputed_series, strategy_used).
-
-        - drop_column: returns the original series unchanged (caller should drop it)
-        - mean_median: numeric -> median (robust to skew); categorical falls back to mode
-        - mode: most frequent value
-        - predictive: simple regression/classification imputation using the
-          columns identified as related during MAR testing
-        - flag_mnar: no automatic fix applied; series returned unchanged with a
-          boolean indicator column also recommended (left to the caller)
-        """
+        """Apply the recommended strategy and return (imputed_series, strategy_used)."""
         strategy = self.recommend_strategy(column)
         series = self.df[column].copy()
 
@@ -237,63 +214,58 @@ class MissingDataAnalyzer:
             model = LinearRegression().fit(train[predictors], train[column])
             preds = model.predict(data.loc[predict_mask, predictors])
             series.loc[predict_mask] = preds
-            # Anything still missing (predictors also missing) falls back to median.
             remaining = series.isna()
             if remaining.any():
                 series.loc[remaining] = series.median()
             return series, strategy
 
-        # flag_mnar
         log.info("'%s' classified as possible MNAR — no automatic imputation applied "
                  "(consider adding a missingness indicator column and reviewing manually).", column)
         return series, strategy
 
     # ------------------------------------------------------------------
-    def plot_missing_heatmap(self, figsize: Tuple[int, int] = (12, 8), max_cols: int = 30,
-                              out_path: Optional[str] = None, show: bool = True):
+    def plot_missing_heatmap(self, max_cols: int = 30, out_path: Optional[str] = None, show: bool = True):
         cols_with_missing = [c for c in self.df.columns if self.df[c].isna().sum() > 0][:max_cols]
         if not cols_with_missing:
             log.warning("No missing values to visualize")
             return
-        fig = plt.figure(figsize=figsize)
+        height = max(4, min(0.35 * len(cols_with_missing) + 2, 20))
+        fig, ax = plt.subplots(figsize=(12, height), constrained_layout=True)
         missing_matrix = self.df[cols_with_missing].isna()
-        sns.heatmap(missing_matrix.T, cbar=False, yticklabels=True, cmap="RdYlGn_r", vmin=0, vmax=1)
-        plt.title("Missing Value Pattern (Yellow = Missing)")
-        plt.xlabel("Row Index")
-        plt.ylabel("Column")
-        plt.tight_layout()
+        sns.heatmap(missing_matrix.T, cbar=False, yticklabels=True, cmap="RdYlGn_r", vmin=0, vmax=1, ax=ax)
+        ax.set_title("Missing Value Pattern (Yellow = Missing)")
+        ax.set_xlabel("Row Index")
+        ax.set_ylabel("Column")
         finalize_plot(fig, out_path, show)
 
-    def plot_missing_bar(self, figsize: Tuple[int, int] = (10, 6),
-                          out_path: Optional[str] = None, show: bool = True):
+    def plot_missing_bar(self, out_path: Optional[str] = None, show: bool = True):
         summary = self.get_missing_summary()
         if summary.empty:
             log.warning("No missing values to plot")
             return
-        fig = plt.figure(figsize=figsize)
-        plt.barh(summary["column"], summary["missing_percentage"], color="coral", edgecolor="black")
-        plt.xlabel("Missing Percentage (%)")
-        plt.ylabel("Column")
-        plt.title("Missing Value Percentage by Column")
-        plt.grid(axis="x", alpha=0.3)
+        height = max(4, min(0.4 * len(summary) + 2, 16))
+        fig, ax = plt.subplots(figsize=(10, height), constrained_layout=True)
+        ax.barh(summary["column"], summary["missing_percentage"], color="coral", edgecolor="black")
+        ax.set_xlabel("Missing Percentage (%)")
+        ax.set_ylabel("Column")
+        ax.set_title("Missing Value Percentage by Column")
+        ax.grid(axis="x", alpha=0.3)
         for i, (col, pct) in enumerate(zip(summary["column"], summary["missing_percentage"])):
-            plt.text(pct + 1, i, f"{pct:.1f}%", va="center")
-        plt.tight_layout()
+            ax.text(pct + 1, i, f"{pct:.1f}%", va="center", fontsize=9)
         finalize_plot(fig, out_path, show)
 
-    def plot_missing_correlation(self, figsize: Tuple[int, int] = (10, 8),
-                                  out_path: Optional[str] = None, show: bool = True):
+    def plot_missing_correlation(self, out_path: Optional[str] = None, show: bool = True):
         missing_matrix = self.df.isna().astype(int)
         cols_with_missing = [c for c in missing_matrix.columns if missing_matrix[c].sum() > 0]
         if len(cols_with_missing) < 2:
             log.warning("Need at least 2 columns with missing values")
             return
-        fig = plt.figure(figsize=figsize)
+        size = max(6, min(0.5 * len(cols_with_missing) + 4, 18))
+        fig, ax = plt.subplots(figsize=(size, size * 0.85), constrained_layout=True)
         missing_corr = missing_matrix[cols_with_missing].corr()
         sns.heatmap(missing_corr, annot=True, fmt=".2f", cmap="coolwarm", center=0, square=True,
-                    linewidths=1, cbar_kws={"shrink": 0.8})
-        plt.title("Correlation of Missing Value Patterns")
-        plt.tight_layout()
+                    linewidths=1, cbar_kws={"shrink": 0.8}, ax=ax)
+        ax.set_title("Correlation of Missing Value Patterns")
         finalize_plot(fig, out_path, show)
 
     # ------------------------------------------------------------------
@@ -341,31 +313,30 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     show = not args.no_show
 
-    df = load_dataframe(args.input_csv, _demo_dataframe)
+    df = load_dataframe(args, _demo_dataframe)
     analyzer = MissingDataAnalyzer(df)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir, reports_dir = get_output_dirs(args.output_dir, "missing_data_analyzer")
 
     report = analyzer.generate_full_report()
 
     if not report["summary"].empty:
-        report["summary"].to_csv(out_dir / "missing_summary.csv", index=False)
+        report["summary"].to_csv(reports_dir / "missing_summary.csv", index=False)
         print("Missing Value Summary:")
         print(report["summary"].to_string(index=False))
 
     if not report["patterns"].empty:
-        report["patterns"].to_csv(out_dir / "missing_patterns.csv", index=False)
+        report["patterns"].to_csv(reports_dir / "missing_patterns.csv", index=False)
         print("\nMissingness Patterns (Co-occurrence):")
         print(report["patterns"].to_string(index=False))
 
     if not report["classifications"].empty:
-        report["classifications"].to_csv(out_dir / "missingness_classifications.csv", index=False)
+        report["classifications"].to_csv(reports_dir / "missingness_classifications.csv", index=False)
         print("\nMissingness Classifications (heuristic, Bonferroni-corrected):")
         print(report["classifications"].to_string(index=False))
 
     if not report["recommendations"].empty:
-        report["recommendations"].to_csv(out_dir / "imputation_recommendations.csv", index=False)
+        report["recommendations"].to_csv(reports_dir / "imputation_recommendations.csv", index=False)
         print("\nImputation Recommendations:")
         print(report["recommendations"].to_string(index=False))
 
@@ -379,13 +350,13 @@ def main(argv=None) -> int:
             else:
                 imputed_df[col] = new_series
             applied.append({"column": col, "strategy_applied": strategy_used})
-        pd.DataFrame(applied).to_csv(out_dir / "imputation_applied.csv", index=False)
-        imputed_df.to_csv(out_dir / "imputed_dataset.csv", index=False)
-        print(f"\nImputed dataset written to {out_dir / 'imputed_dataset.csv'}")
+        pd.DataFrame(applied).to_csv(reports_dir / "imputation_applied.csv", index=False)
+        imputed_df.to_csv(reports_dir / "imputed_dataset.csv", index=False)
+        print(f"\nImputed dataset written to {reports_dir / 'imputed_dataset.csv'}")
 
-    analyzer.plot_missing_bar(out_path=str(out_dir / "missing_bar.png"), show=show)
-    analyzer.plot_missing_heatmap(out_path=str(out_dir / "missing_heatmap.png"), show=show)
-    analyzer.plot_missing_correlation(out_path=str(out_dir / "missing_correlation.png"), show=show)
+    analyzer.plot_missing_bar(out_path=str(plots_dir / "missing_bar.png"), show=show)
+    analyzer.plot_missing_heatmap(out_path=str(plots_dir / "missing_heatmap.png"), show=show)
+    analyzer.plot_missing_correlation(out_path=str(plots_dir / "missing_correlation.png"), show=show)
 
     return 0
 

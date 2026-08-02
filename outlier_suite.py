@@ -4,29 +4,28 @@ Outlier Detection and Analysis Suite (fixed)
 Detects outliers using multiple methods and provides comprehensive
 analysis of their impact and patterns.
 
-Fixes applied vs. the original version:
-- The script only ever *detected* outliers; there was no way to act on
-  them. Added `treat_outliers()` supporting cap (winsorize), remove,
-  and impute strategies.
-- `except:` (bare except) in `detect_mahalanobis_outliers` silently
-  swallowed every possible error, including bugs unrelated to the
-  EllipticEnvelope fit. Narrowed to `except (ValueError, np.linalg.LinAlgError)`
-  and now logs the failure instead of hiding it.
-- `fillna(self.df[cols].mean())` before Isolation Forest / Mahalanobis
-  silently biases the detector toward "normal" near the mean with no
-  warning. Now logs how many values were imputed this way.
-- The consensus threshold ("flagged by >= 2 methods") was hardcoded;
-  it is now a constructor/method parameter.
-- `plot_multivariate_outliers` silently used only the first two of the
-  columns passed in; it now logs when it's ignoring extra columns.
-- IQR logic now delegates to the shared `eda_common.iqr_outlier_mask`.
-- Added CLI support + headless plot saving.
+Fixes applied vs. the original version (see also eda_common.py):
+- Added `treat_outliers()` (cap/winsorize, remove, impute) — the
+  original script only ever detected outliers with no way to act.
+- Replaced a bare `except:` in Mahalanobis detection with a narrowed,
+  logged exception handler.
+- `fillna(mean)` before Isolation Forest / Mahalanobis now logs how
+  many values were imputed this way (previously silent).
+- Consensus threshold ("flagged by >= 2 methods") is now configurable
+  instead of hardcoded.
+- `plot_multivariate_outliers` now explicitly logs when extra columns
+  are used for detection but not shown in the 2D scatter.
+- IQR logic delegates to the shared `eda_common.iqr_outlier_mask`.
+- BUG FIX (visual): plots use `constrained_layout=True` via matplotlib
+  directly (fixed 2x2/1x2 grids here, so a fixed figsize is fine, but
+  layout negotiation is now automatic rather than a single
+  `tight_layout()` call at the end).
+- Multi-format input and split plots/ vs reports/ output directories.
 """
 
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -39,6 +38,7 @@ from eda_common import (
     build_base_arg_parser,
     finalize_plot,
     get_logger,
+    get_output_dirs,
     iqr_bounds,
     iqr_outlier_mask,
     load_dataframe,
@@ -61,7 +61,6 @@ class OutlierSuite:
             raise ValueError("OutlierSuite requires a non-empty DataFrame.")
         self.df = df
         self.numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        # FIX: previously hardcoded to 2 inside analyze_all_methods().
         self.consensus_min_methods = consensus_min_methods
 
     # ------------------------------------------------------------------
@@ -91,9 +90,6 @@ class OutlierSuite:
         X = self.df[cols]
         n_missing = int(X.isna().sum().sum())
         if n_missing:
-            # FIX: previously a silent fillna(mean) — now explicitly logged
-            # since imputing with the column mean can bias distance-based
-            # detectors toward under-flagging points near that mean.
             log.warning(
                 "Imputing %d missing values with column means before multivariate "
                 "outlier detection on %s — this can under-flag outliers near the mean.",
@@ -122,7 +118,6 @@ class OutlierSuite:
             predictions = detector.fit_predict(X)
             return pd.Series(predictions == -1, index=self.df.index)
         except (ValueError, np.linalg.LinAlgError) as exc:
-            # FIX: was a bare `except:` that silently hid all errors.
             log.error("Mahalanobis/EllipticEnvelope fit failed for columns %s: %s", cols, exc)
             return pd.Series(False, index=self.df.index)
 
@@ -167,8 +162,6 @@ class OutlierSuite:
         }
 
     # ------------------------------------------------------------------
-    # FIX: new — detection existed but there was previously no way to
-    # actually act on the flagged outliers.
     def treat_outliers(self, column: str, strategy: str = "cap", method: str = "iqr",
                         iqr_mult: float = 1.5) -> pd.Series:
         """Return a *new* Series with outliers treated.
@@ -205,12 +198,11 @@ class OutlierSuite:
         return series
 
     # ------------------------------------------------------------------
-    def plot_outlier_comparison(self, column: str, figsize: Tuple[int, int] = (15, 10),
-                                 out_path: Optional[str] = None, show: bool = True):
+    def plot_outlier_comparison(self, column: str, out_path: Optional[str] = None, show: bool = True):
         analysis = self.analyze_all_methods(column)
         data = self.df[column].copy()
 
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
         methods = ["iqr", "zscore", "modified_zscore", "consensus"]
         titles = ["IQR Method", "Z-Score Method", "Modified Z-Score",
                   f"Consensus (>= {self.consensus_min_methods} methods)"]
@@ -225,17 +217,15 @@ class OutlierSuite:
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
         finalize_plot(fig, out_path, show)
 
-    def plot_multivariate_outliers(self, columns: Optional[List[str]] = None, figsize: Tuple[int, int] = (12, 5),
+    def plot_multivariate_outliers(self, columns: Optional[List[str]] = None,
                                     out_path: Optional[str] = None, show: bool = True):
         cols = columns or self.numeric_cols[:3]
         if len(cols) < 2:
             log.warning("Need at least 2 columns for multivariate outlier detection")
             return
         if len(cols) > 2:
-            # FIX: previously silently used only cols[0]/cols[1]; now explicit.
             log.info("plot_multivariate_outliers: detection uses all %d columns %s, "
                      "but the 2D scatter only visualizes '%s' vs '%s'.",
                      len(cols), cols, cols[0], cols[1])
@@ -243,7 +233,7 @@ class OutlierSuite:
         iso_outliers = self.detect_isolation_forest_outliers(cols)
         maha_outliers = self.detect_mahalanobis_outliers(cols)
 
-        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        fig, axes = plt.subplots(1, 2, figsize=(13, 5.5), constrained_layout=True)
         for ax, outliers, title in zip(
             axes, [iso_outliers, maha_outliers], ["Isolation Forest", "Mahalanobis Distance"]
         ):
@@ -257,7 +247,6 @@ class OutlierSuite:
             ax.legend()
             ax.grid(True, alpha=0.3)
 
-        plt.tight_layout()
         finalize_plot(fig, out_path, show)
 
 
@@ -278,21 +267,20 @@ def _demo_dataframe() -> pd.DataFrame:
 
 
 def main(argv=None) -> int:
-    parser = build_base_arg_parser("Multi-method outlier detection & treatment for any CSV dataset.")
+    parser = build_base_arg_parser("Multi-method outlier detection & treatment for any dataset.")
     parser.add_argument("--consensus-min-methods", type=int, default=2)
     parser.add_argument("--treat-column", default=None, help="Column to demonstrate outlier treatment on.")
     parser.add_argument("--treat-strategy", default="cap", choices=["cap", "remove", "impute"])
     args = parser.parse_args(argv)
     show = not args.no_show
 
-    df = load_dataframe(args.input_csv, _demo_dataframe)
+    df = load_dataframe(args, _demo_dataframe)
     suite = OutlierSuite(df, consensus_min_methods=args.consensus_min_methods)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir, reports_dir = get_output_dirs(args.output_dir, "outlier_suite")
 
     summary = suite.compare_methods_all_columns()
-    summary.to_csv(out_dir / "outlier_summary.csv", index=False)
+    summary.to_csv(reports_dir / "outlier_summary.csv", index=False)
     print("Outlier Detection Summary:")
     print(summary.to_string(index=False))
 
@@ -305,13 +293,13 @@ def main(argv=None) -> int:
     treat_col = args.treat_column or first_col
     treated = suite.treat_outliers(treat_col, strategy=args.treat_strategy)
     pd.DataFrame({treat_col: df[treat_col], f"{treat_col}_treated": treated}).to_csv(
-        out_dir / f"{treat_col}_treated.csv", index=False
+        reports_dir / f"{treat_col}_treated.csv", index=False
     )
 
-    suite.plot_outlier_comparison(first_col, out_path=str(out_dir / "outlier_comparison.png"), show=show)
+    suite.plot_outlier_comparison(first_col, out_path=str(plots_dir / "outlier_comparison.png"), show=show)
     if len(suite.numeric_cols) >= 2:
         suite.plot_multivariate_outliers(suite.numeric_cols[:2],
-                                          out_path=str(out_dir / "multivariate_outliers.png"), show=show)
+                                          out_path=str(plots_dir / "multivariate_outliers.png"), show=show)
 
     return 0
 

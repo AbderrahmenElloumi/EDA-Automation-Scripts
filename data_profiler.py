@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from eda_common import build_base_arg_parser, get_logger, load_dataframe
+from eda_common import build_base_arg_parser, get_logger, get_output_dirs, load_dataframe
 
 import warnings
 
@@ -350,18 +350,18 @@ def main(argv=None) -> int:
     parser.add_argument("--high-cardinality-threshold", type=float, default=0.5)
     args = parser.parse_args(argv)
 
-    df = load_dataframe(args.input_csv, _demo_dataframe)
+    df = load_dataframe(args, _demo_dataframe)
 
     profiler = DataProfiler(df, high_cardinality_threshold=args.high_cardinality_threshold)
     report = profiler.generate_full_profile()
     profiler.print_summary(report)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # data_profiler produces no plots, only tabular reports.
+    _, reports_dir = get_output_dirs(args.output_dir, "data_profiler")
     for key in ["numeric_profiles", "categorical_profiles", "datetime_profiles", "boolean_profiles", "data_quality_issues"]:
         df_ = report[key]
         if not df_.empty:
-            out_path = out_dir / f"{key}.csv"
+            out_path = reports_dir / f"{key}.csv"
             df_.to_csv(out_path, index=False)
             log.info("Wrote %s", out_path)
 

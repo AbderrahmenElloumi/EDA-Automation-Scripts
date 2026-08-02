@@ -4,33 +4,29 @@ Correlation and Relationship Explorer (fixed)
 Analyzes relationships between variables using multiple correlation
 methods and detects multicollinearity issues.
 
-Fixes applied vs. the original version:
+Fixes applied vs. the original version (see also eda_common.py):
 - REAL BUG: `plot_top_correlations` iterated with
   `for idx, row in top_pairs.iterrows()` and then indexed `axes[idx]`.
   Because `top_pairs` is sorted by correlation strength, its index is
-  NOT a contiguous 0..n range anymore, so `axes[idx]` could raise
-  IndexError or silently place plots on the wrong axis / skip axes.
-  Fixed by using `enumerate()` over `.itertuples()` instead of the raw
-  (and non-sequential) DataFrame index.
-- `mutual_information_analysis` silently replaced NaNs with 0
-  (`fillna(0)`), biasing scores with no warning. It now logs how many
-  rows were dropped/filled and lets the caller choose the strategy.
-- No significance testing existed for correlation coefficients — added
-  p-values via `scipy.stats.pearsonr` / `spearmanr` / `kendalltau`.
-- No categorical-categorical association existed despite the script
-  claiming to explore "relationships between all variables" — added
-  Cramer's V.
-- Heatmaps could become unreadable with many columns — added a
-  `max_features` cap with a warning.
-- Added CLI support + plot saving via the shared helper.
+  NOT a contiguous 0..n range, so `axes[idx]` could raise IndexError or
+  place plots on the wrong axis. Fixed with `enumerate(... .itertuples())`.
+- `mutual_information_analysis` silently replaced NaNs with 0, biasing
+  scores with no warning — now logs dropped rows instead.
+- Added p-values (pearsonr/spearmanr/kendalltau) alongside coefficients.
+- Added Cramer's V for categorical-categorical association.
+- Heatmaps cap at `max_features_for_heatmap` with a warning instead of
+  becoming unreadable.
+- BUG FIX (visual): all multi-panel plots now use `eda_common.create_grid`
+  (dynamic figsize + constrained_layout) instead of a fixed figsize,
+  which is what caused title/label overlap in dense grids.
+- Multi-format input and split plots/ vs reports/ output directories.
 """
 
 from __future__ import annotations
 
 import sys
 from itertools import combinations
-from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -38,8 +34,10 @@ from scipy import stats
 
 from eda_common import (
     build_base_arg_parser,
+    create_grid,
     finalize_plot,
     get_logger,
+    get_output_dirs,
     load_dataframe,
     use_headless_backend_if_needed,
 )
@@ -67,6 +65,9 @@ class CorrelationExplorer:
             raise ValueError("CorrelationExplorer requires a non-empty DataFrame.")
         self.df = df
         self.numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        # Explicitly excludes datetime64 columns (previously object-only
+        # selection meant this was already safe, but being explicit avoids
+        # any future dtype surprises after auto-datetime casting).
         self.categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
         self.max_features_for_heatmap = max_features_for_heatmap
 
@@ -89,8 +90,6 @@ class CorrelationExplorer:
             pair = self.df[[c1, c2]].dropna()
             if len(pair) < 3:
                 continue
-            # FIX: compute the coefficient AND its p-value together so
-            # results are testable, not just point estimates.
             result = test_fn(pair[c1], pair[c2])
             corr_val, p_value = float(result[0]), float(result[1])
             if abs(corr_val) >= threshold:
@@ -154,12 +153,6 @@ class CorrelationExplorer:
 
     # ------------------------------------------------------------------
     def cramers_v_matrix(self, columns: Optional[List[str]] = None) -> pd.DataFrame:
-        """Association matrix for categorical columns (Cramer's V).
-
-        FIX / new feature: the original script only handled numeric-numeric
-        relationships despite the tutorial promising "relationships between
-        all variables in your dataset".
-        """
         cols = columns or self.categorical_cols
         if len(cols) < 2:
             log.warning("Need at least 2 categorical columns for Cramer's V")
@@ -193,10 +186,9 @@ class CorrelationExplorer:
         subset = subset.dropna()
         n_after = len(subset)
         if n_after < n_before:
-            # FIX: log the silent data loss instead of just fillna(0)-biasing scores.
             log.warning(
-                "mutual_information_analysis: dropped %d/%d rows with missing values "
-                "(target or feature columns).", n_before - n_after, n_before,
+                "mutual_information_analysis: dropped %d/%d rows with missing values.",
+                n_before - n_after, n_before,
             )
         if n_after == 0:
             log.error("No complete rows remain after dropping missing values.")
@@ -215,14 +207,12 @@ class CorrelationExplorer:
         return mi_df.sort_values("mutual_information", ascending=False).reset_index(drop=True)
 
     # ------------------------------------------------------------------
-    def plot_correlation_heatmap(self, method: str = "pearson", figsize: Tuple[int, int] = (12, 10),
-                                  annot: bool = True, cmap: str = "coolwarm",
+    def plot_correlation_heatmap(self, method: str = "pearson", annot: bool = True, cmap: str = "coolwarm",
                                   out_path: Optional[str] = None, show: bool = True):
         cols = self.numeric_cols
         if len(cols) > self.max_features_for_heatmap:
-            log.warning("%d numeric columns exceeds max_features_for_heatmap=%d; "
-                        "showing the first %d only.", len(cols), self.max_features_for_heatmap,
-                        self.max_features_for_heatmap)
+            log.warning("%d numeric columns exceeds max_features_for_heatmap=%d; showing the first %d only.",
+                        len(cols), self.max_features_for_heatmap, self.max_features_for_heatmap)
             cols = cols[: self.max_features_for_heatmap]
 
         corr_matrix = self.calculate_correlations(method=method, columns=cols)
@@ -230,18 +220,17 @@ class CorrelationExplorer:
             log.warning("No correlation matrix to plot")
             return
 
-        fig = plt.figure(figsize=figsize)
+        size = max(6, min(0.5 * len(cols) + 4, 20))
+        fig, ax = plt.subplots(figsize=(size, size * 0.85), constrained_layout=True)
         mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
         sns.heatmap(corr_matrix, mask=mask, annot=annot and len(cols) <= 25, fmt=".2f", cmap=cmap,
-                    center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8})
-        plt.title(f"{method.capitalize()} Correlation Matrix")
-        plt.tight_layout()
+                    center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8}, ax=ax)
+        ax.set_title(f"{method.capitalize()} Correlation Matrix")
         finalize_plot(fig, out_path, show)
 
-    def plot_correlation_comparison(self, figsize: Tuple[int, int] = (18, 5),
-                                     out_path: Optional[str] = None, show: bool = True):
+    def plot_correlation_comparison(self, out_path: Optional[str] = None, show: bool = True):
         methods = ["pearson", "spearman", "kendall"]
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=True)
         for idx, method in enumerate(methods):
             corr = self.calculate_correlations(method=method)
             if corr.empty:
@@ -250,11 +239,9 @@ class CorrelationExplorer:
             sns.heatmap(corr, mask=mask, ax=axes[idx], cmap="coolwarm", center=0, square=True,
                         linewidths=0.5, cbar_kws={"shrink": 0.8}, annot=len(corr) < 10, fmt=".2f")
             axes[idx].set_title(f"{method.capitalize()} Correlation")
-        plt.tight_layout()
         finalize_plot(fig, out_path, show)
 
     def plot_top_correlations(self, n_pairs: int = 10, method: str = "pearson",
-                               figsize: Tuple[int, int] = (15, 10),
                                out_path: Optional[str] = None, show: bool = True):
         high_corr = self.find_high_correlations(threshold=0.0, method=method)
         if high_corr.empty:
@@ -262,27 +249,23 @@ class CorrelationExplorer:
             return
 
         top_pairs = high_corr.head(n_pairs)
-        n_cols = 3
-        n_rows = (len(top_pairs) + n_cols - 1) // n_cols
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-        axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+        fig, axes, _ = create_grid(len(top_pairs), 3, per_row_height=3.6)
 
-        # FIX: enumerate() gives a clean, contiguous 0..n-1 position to index
-        # `axes` with — the original `row.iterrows()` index (post-sort) was
-        # NOT contiguous and could raise IndexError or scatter plots onto the
-        # wrong subplot.
+        # FIX: enumerate() over a contiguous position instead of the
+        # post-sort DataFrame index — the original `iterrows()` index
+        # could exceed len(axes) or scatter plots onto the wrong subplot.
         for pos, row in enumerate(top_pairs.itertuples(index=False)):
             ax = axes[pos]
             feat1, feat2, corr = row.feature_1, row.feature_2, row.correlation
             ax.scatter(self.df[feat1], self.df[feat2], alpha=0.5, s=20)
-            ax.set_xlabel(feat1)
-            ax.set_ylabel(feat2)
-            ax.set_title(f"r = {corr:.3f}")
+            ax.set_xlabel(feat1, fontsize=9)
+            ax.set_ylabel(feat2, fontsize=9)
+            ax.set_title(f"r = {corr:.3f}", fontsize=10)
+            ax.tick_params(labelsize=8)
             ax.grid(True, alpha=0.3)
 
         for pos in range(len(top_pairs), len(axes)):
             axes[pos].axis("off")
-        plt.tight_layout()
         finalize_plot(fig, out_path, show)
 
 
@@ -298,30 +281,31 @@ def _demo_dataframe() -> pd.DataFrame:
     return pd.DataFrame({
         "feature_A": x1, "feature_B": x2, "feature_C": x3, "feature_D": x4, "feature_E": x5,
         "target": x1 * 2 + x4 - x3 * 0.5 + np.random.normal(0, 10, n),
+        "region": np.random.choice(["North", "South", "East", "West"], n),
+        "tier": np.random.choice(["Gold", "Silver", "Bronze"], n),
     })
 
 
 def main(argv=None) -> int:
-    parser = build_base_arg_parser("Correlation & relationship explorer for any CSV dataset.")
+    parser = build_base_arg_parser("Correlation & relationship explorer for any dataset.")
     parser.add_argument("--target", default=None, help="Target column for mutual-information analysis.")
     args = parser.parse_args(argv)
     show = not args.no_show
 
-    df = load_dataframe(args.input_csv, _demo_dataframe)
+    df = load_dataframe(args, _demo_dataframe)
     explorer = CorrelationExplorer(df)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    plots_dir, reports_dir = get_output_dirs(args.output_dir, "correlation_explorer")
 
     high_corr = explorer.find_high_correlations(threshold=0.5)
     if not high_corr.empty:
-        high_corr.to_csv(out_dir / "high_correlations.csv", index=False)
+        high_corr.to_csv(reports_dir / "high_correlations.csv", index=False)
         print("High Correlations (threshold = 0.5):")
         print(high_corr.to_string(index=False))
 
     vif = explorer.calculate_vif()
     if not vif.empty:
-        vif.to_csv(out_dir / "vif.csv", index=False)
+        vif.to_csv(reports_dir / "vif.csv", index=False)
         print("\nVariance Inflation Factors:")
         print(vif.to_string(index=False))
 
@@ -329,19 +313,19 @@ def main(argv=None) -> int:
     if target:
         mi = explorer.mutual_information_analysis(target)
         if not mi.empty:
-            mi.to_csv(out_dir / "mutual_information.csv", index=False)
+            mi.to_csv(reports_dir / "mutual_information.csv", index=False)
             print(f"\nMutual Information with '{target}':")
             print(mi.to_string(index=False))
 
     cramers = explorer.cramers_v_matrix()
     if not cramers.empty:
-        cramers.to_csv(out_dir / "cramers_v.csv")
+        cramers.to_csv(reports_dir / "cramers_v.csv")
         print("\nCramer's V (categorical association):")
         print(cramers.to_string())
 
-    explorer.plot_correlation_heatmap(out_path=str(out_dir / "correlation_heatmap.png"), show=show)
-    explorer.plot_correlation_comparison(out_path=str(out_dir / "correlation_comparison.png"), show=show)
-    explorer.plot_top_correlations(n_pairs=6, out_path=str(out_dir / "top_correlations.png"), show=show)
+    explorer.plot_correlation_heatmap(out_path=str(plots_dir / "correlation_heatmap.png"), show=show)
+    explorer.plot_correlation_comparison(out_path=str(plots_dir / "correlation_comparison.png"), show=show)
+    explorer.plot_top_correlations(n_pairs=6, out_path=str(plots_dir / "top_correlations.png"), show=show)
 
     return 0
 
