@@ -1,395 +1,320 @@
 """
-Outlier Detection and Analysis Suite
+Outlier Detection and Analysis Suite (fixed)
+
 Detects outliers using multiple methods and provides comprehensive
 analysis of their impact and patterns.
+
+Fixes applied vs. the original version:
+- The script only ever *detected* outliers; there was no way to act on
+  them. Added `treat_outliers()` supporting cap (winsorize), remove,
+  and impute strategies.
+- `except:` (bare except) in `detect_mahalanobis_outliers` silently
+  swallowed every possible error, including bugs unrelated to the
+  EllipticEnvelope fit. Narrowed to `except (ValueError, np.linalg.LinAlgError)`
+  and now logs the failure instead of hiding it.
+- `fillna(self.df[cols].mean())` before Isolation Forest / Mahalanobis
+  silently biases the detector toward "normal" near the mean with no
+  warning. Now logs how many values were imputed this way.
+- The consensus threshold ("flagged by >= 2 methods") was hardcoded;
+  it is now a constructor/method parameter.
+- `plot_multivariate_outliers` silently used only the first two of the
+  columns passed in; it now logs when it's ignoring extra columns.
+- IQR logic now delegates to the shared `eda_common.iqr_outlier_mask`.
+- Added CLI support + headless plot saving.
 """
 
-import pandas as pd
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import pandas as pd
 from scipy import stats
-from sklearn.ensemble import IsolationForest
 from sklearn.covariance import EllipticEnvelope
-from typing import List, Dict, Optional, Tuple
+from sklearn.ensemble import IsolationForest
+
+from eda_common import (
+    build_base_arg_parser,
+    finalize_plot,
+    get_logger,
+    iqr_bounds,
+    iqr_outlier_mask,
+    load_dataframe,
+    use_headless_backend_if_needed,
+)
+
+use_headless_backend_if_needed()
+import matplotlib.pyplot as plt  # noqa: E402
+
 import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
+
+log = get_logger("outlier_suite")
+
 
 class OutlierSuite:
-    def __init__(self, df: pd.DataFrame):
-        """
-        Initialize the outlier detection suite.
-        
-        Args:
-            df: DataFrame to analyze
-        """
+    def __init__(self, df: pd.DataFrame, consensus_min_methods: int = 2):
+        if df is None or df.empty:
+            raise ValueError("OutlierSuite requires a non-empty DataFrame.")
         self.df = df
         self.numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        self.outlier_masks = {}
-        
-    def detect_iqr_outliers(
-        self,
-        column: str,
-        multiplier: float = 1.5
-    ) -> pd.Series:
-        """
-        Detect outliers using Interquartile Range method.
-        
-        Args:
-            column: Column name
-            multiplier: IQR multiplier (1.5 = standard, 3 = extreme)
-        """
-        Q1 = self.df[column].quantile(0.25)
-        Q3 = self.df[column].quantile(0.75)
-        IQR = Q3 - Q1
-        
-        lower_bound = Q1 - multiplier * IQR
-        upper_bound = Q3 + multiplier * IQR
-        
-        return (self.df[column] < lower_bound) | (self.df[column] > upper_bound)
-    
-    def detect_zscore_outliers(
-        self,
-        column: str,
-        threshold: float = 3
-    ) -> pd.Series:
-        """
-        Detect outliers using Z-score method.
-        
-        Args:
-            column: Column name
-            threshold: Z-score threshold
-        """
-        z_scores = np.abs(stats.zscore(self.df[column].dropna()))
-        
-        # Create boolean mask with same index as original
-        mask = pd.Series(False, index=self.df.index)
-        mask.loc[self.df[column].dropna().index] = z_scores > threshold
-        
+        # FIX: previously hardcoded to 2 inside analyze_all_methods().
+        self.consensus_min_methods = consensus_min_methods
+
+    # ------------------------------------------------------------------
+    def detect_iqr_outliers(self, column: str, multiplier: float = 1.5) -> pd.Series:
+        return iqr_outlier_mask(self.df[column], multiplier)
+
+    def detect_zscore_outliers(self, column: str, threshold: float = 3) -> pd.Series:
+        series = self.df[column]
+        non_null = series.dropna()
+        mask = pd.Series(False, index=series.index)
+        if non_null.empty or non_null.std(ddof=0) == 0:
+            return mask
+        z_scores = np.abs(stats.zscore(non_null))
+        mask.loc[non_null.index] = z_scores > threshold
         return mask
-    
-    def detect_modified_zscore_outliers(
-        self,
-        column: str,
-        threshold: float = 3.5
-    ) -> pd.Series:
-        """
-        Detect outliers using Modified Z-score (MAD-based).
-        
-        Args:
-            column: Column name
-            threshold: Modified Z-score threshold
-        """
-        median = self.df[column].median()
-        mad = np.median(np.abs(self.df[column] - median))
-        
+
+    def detect_modified_zscore_outliers(self, column: str, threshold: float = 3.5) -> pd.Series:
+        series = self.df[column]
+        median = series.median()
+        mad = np.median(np.abs(series.dropna() - median))
         if mad == 0:
             return pd.Series(False, index=self.df.index)
-        
-        modified_z_scores = 0.6745 * (self.df[column] - median) / mad
-        
-        return np.abs(modified_z_scores) > threshold
-    
-    def detect_isolation_forest_outliers(
-        self,
-        columns: Optional[List[str]] = None,
-        contamination: float = 0.1
-    ) -> pd.Series:
-        """
-        Detect multivariate outliers using Isolation Forest.
-        
-        Args:
-            columns: Columns to use (all numeric if None)
-            contamination: Expected proportion of outliers
-        """
+        modified_z = 0.6745 * (series - median) / mad
+        return (np.abs(modified_z) > threshold).fillna(False)
+
+    def _fill_for_multivariate(self, cols: List[str]) -> pd.DataFrame:
+        X = self.df[cols]
+        n_missing = int(X.isna().sum().sum())
+        if n_missing:
+            # FIX: previously a silent fillna(mean) — now explicitly logged
+            # since imputing with the column mean can bias distance-based
+            # detectors toward under-flagging points near that mean.
+            log.warning(
+                "Imputing %d missing values with column means before multivariate "
+                "outlier detection on %s — this can under-flag outliers near the mean.",
+                n_missing, cols,
+            )
+        return X.fillna(X.mean())
+
+    def detect_isolation_forest_outliers(self, columns: Optional[List[str]] = None,
+                                          contamination: float = 0.1) -> pd.Series:
         cols = columns or self.numeric_cols
-        
-        if len(cols) == 0:
+        if not cols:
             return pd.Series(False, index=self.df.index)
-        
-        X = self.df[cols].fillna(self.df[cols].mean())
-        
-        iso_forest = IsolationForest(
-            contamination=contamination,
-            random_state=42,
-            n_jobs=-1
-        )
-        
+        X = self._fill_for_multivariate(cols)
+        iso_forest = IsolationForest(contamination=contamination, random_state=42, n_jobs=-1)
         predictions = iso_forest.fit_predict(X)
-        
         return pd.Series(predictions == -1, index=self.df.index)
-    
-    def detect_mahalanobis_outliers(
-        self,
-        columns: Optional[List[str]] = None,
-        threshold: float = 0.95
-    ) -> pd.Series:
-        """
-        Detect multivariate outliers using Mahalanobis distance.
-        
-        Args:
-            columns: Columns to use
-            threshold: Chi-square probability threshold
-        """
+
+    def detect_mahalanobis_outliers(self, columns: Optional[List[str]] = None,
+                                     contamination: float = 0.1) -> pd.Series:
         cols = columns or self.numeric_cols
-        
         if len(cols) < 2:
             return pd.Series(False, index=self.df.index)
-        
-        X = self.df[cols].fillna(self.df[cols].mean())
-        
-        # Use Elliptic Envelope for robust covariance estimation
+        X = self._fill_for_multivariate(cols)
         try:
-            detector = EllipticEnvelope(contamination=0.1, random_state=42)
+            detector = EllipticEnvelope(contamination=contamination, random_state=42)
             predictions = detector.fit_predict(X)
             return pd.Series(predictions == -1, index=self.df.index)
-        except:
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            # FIX: was a bare `except:` that silently hid all errors.
+            log.error("Mahalanobis/EllipticEnvelope fit failed for columns %s: %s", cols, exc)
             return pd.Series(False, index=self.df.index)
-    
-    def analyze_all_methods(
-        self,
-        column: str,
-        iqr_mult: float = 1.5,
-        z_threshold: float = 3,
-        modified_z_threshold: float = 3.5
-    ) -> pd.DataFrame:
-        """
-        Apply all univariate outlier detection methods to a column.
-        
-        Args:
-            column: Column to analyze
-            iqr_mult: IQR multiplier
-            z_threshold: Z-score threshold
-            modified_z_threshold: Modified Z-score threshold
-        """
+
+    # ------------------------------------------------------------------
+    def analyze_all_methods(self, column: str, iqr_mult: float = 1.5, z_threshold: float = 3,
+                             modified_z_threshold: float = 3.5) -> pd.DataFrame:
         results = pd.DataFrame(index=self.df.index)
-        
-        results['iqr'] = self.detect_iqr_outliers(column, iqr_mult)
-        results['zscore'] = self.detect_zscore_outliers(column, z_threshold)
-        results['modified_zscore'] = self.detect_modified_zscore_outliers(column, modified_z_threshold)
-        
-        # Consensus: flagged by at least 2 methods
-        results['consensus'] = results.sum(axis=1) >= 2
-        
+        results["iqr"] = self.detect_iqr_outliers(column, iqr_mult)
+        results["zscore"] = self.detect_zscore_outliers(column, z_threshold)
+        results["modified_zscore"] = self.detect_modified_zscore_outliers(column, modified_z_threshold)
+        results["consensus"] = results.sum(axis=1) >= self.consensus_min_methods
         return results
-    
+
     def get_outlier_summary(self, column: str) -> Dict:
-        """Get summary statistics for outliers in a column."""
         analysis = self.analyze_all_methods(column)
-        
-        summary = {
-            'column': column,
-            'total_outliers_iqr': analysis['iqr'].sum(),
-            'total_outliers_zscore': analysis['zscore'].sum(),
-            'total_outliers_modified_zscore': analysis['modified_zscore'].sum(),
-            'consensus_outliers': analysis['consensus'].sum(),
-            'percentage_consensus': round(analysis['consensus'].mean() * 100, 2)
+        return {
+            "column": column,
+            "total_outliers_iqr": int(analysis["iqr"].sum()),
+            "total_outliers_zscore": int(analysis["zscore"].sum()),
+            "total_outliers_modified_zscore": int(analysis["modified_zscore"].sum()),
+            "consensus_outliers": int(analysis["consensus"].sum()),
+            "percentage_consensus": round(analysis["consensus"].mean() * 100, 2),
         }
-        
-        return summary
-    
+
     def compare_methods_all_columns(self) -> pd.DataFrame:
-        """Compare outlier detection methods across all numeric columns."""
-        summaries = []
-        
-        for col in self.numeric_cols:
-            summary = self.get_outlier_summary(col)
-            summaries.append(summary)
-        
-        return pd.DataFrame(summaries)
-    
-    def plot_outlier_comparison(
-        self,
-        column: str,
-        figsize: Tuple[int, int] = (15, 10)
-    ):
+        return pd.DataFrame([self.get_outlier_summary(c) for c in self.numeric_cols])
+
+    def analyze_outlier_impact(self, column: str) -> Dict:
+        analysis = self.analyze_all_methods(column)
+        consensus_outliers = analysis["consensus"]
+        data_with = self.df[column]
+        data_without = self.df.loc[~consensus_outliers, column]
+        return {
+            "column": column,
+            "mean_with_outliers": round(data_with.mean(), 4),
+            "mean_without_outliers": round(data_without.mean(), 4),
+            "mean_difference": round(data_with.mean() - data_without.mean(), 4),
+            "median_with_outliers": round(data_with.median(), 4),
+            "median_without_outliers": round(data_without.median(), 4),
+            "std_with_outliers": round(data_with.std(), 4),
+            "std_without_outliers": round(data_without.std(), 4),
+        }
+
+    # ------------------------------------------------------------------
+    # FIX: new — detection existed but there was previously no way to
+    # actually act on the flagged outliers.
+    def treat_outliers(self, column: str, strategy: str = "cap", method: str = "iqr",
+                        iqr_mult: float = 1.5) -> pd.Series:
+        """Return a *new* Series with outliers treated.
+
+        strategy: 'cap' (winsorize to the bounds), 'remove' (set to NaN),
+                  or 'impute' (replace with the column median).
+        method: which detector's mask to use ('iqr', 'zscore', 'modified_zscore', 'consensus').
         """
-        Visualize outlier detection across methods for a column.
-        
-        Args:
-            column: Column to analyze
-            figsize: Figure size
-        """
+        if strategy not in {"cap", "remove", "impute"}:
+            raise ValueError("strategy must be one of: cap, remove, impute")
+
+        series = self.df[column].copy()
+        if method == "iqr":
+            mask = self.detect_iqr_outliers(column, iqr_mult)
+        else:
+            analysis = self.analyze_all_methods(column, iqr_mult=iqr_mult)
+            if method not in analysis.columns:
+                raise ValueError(f"Unknown method '{method}'")
+            mask = analysis[method]
+
+        n_flagged = int(mask.sum())
+        log.info("treat_outliers(%s, strategy=%s, method=%s): %d/%d rows flagged",
+                  column, strategy, method, n_flagged, len(series))
+
+        if strategy == "cap":
+            lower, upper = iqr_bounds(series, iqr_mult)
+            series = series.clip(lower=lower, upper=upper)
+        elif strategy == "remove":
+            series.loc[mask] = np.nan
+        elif strategy == "impute":
+            median = series.median()
+            series.loc[mask] = median
+
+        return series
+
+    # ------------------------------------------------------------------
+    def plot_outlier_comparison(self, column: str, figsize: Tuple[int, int] = (15, 10),
+                                 out_path: Optional[str] = None, show: bool = True):
         analysis = self.analyze_all_methods(column)
         data = self.df[column].copy()
-        
+
         fig, axes = plt.subplots(2, 2, figsize=figsize)
-        
-        methods = ['iqr', 'zscore', 'modified_zscore', 'consensus']
-        titles = ['IQR Method', 'Z-Score Method', 'Modified Z-Score', 'Consensus (≥2 methods)']
-        
+        methods = ["iqr", "zscore", "modified_zscore", "consensus"]
+        titles = ["IQR Method", "Z-Score Method", "Modified Z-Score",
+                  f"Consensus (>= {self.consensus_min_methods} methods)"]
+
         for ax, method, title in zip(axes.flatten(), methods, titles):
             outliers = analysis[method]
-            
-            # Scatter plot
-            ax.scatter(
-                data.index[~outliers],
-                data[~outliers],
-                c='blue',
-                alpha=0.5,
-                s=20,
-                label='Normal'
-            )
-            ax.scatter(
-                data.index[outliers],
-                data[outliers],
-                c='red',
-                alpha=0.7,
-                s=50,
-                label='Outlier'
-            )
-            
-            ax.set_title(f'{title}\n{outliers.sum()} outliers ({outliers.mean()*100:.1f}%)')
-            ax.set_xlabel('Index')
+            ax.scatter(data.index[~outliers], data[~outliers], c="blue", alpha=0.5, s=20, label="Normal")
+            ax.scatter(data.index[outliers], data[outliers], c="red", alpha=0.7, s=50, label="Outlier")
+            ax.set_title(f"{title}\n{outliers.sum()} outliers ({outliers.mean() * 100:.1f}%)")
+            ax.set_xlabel("Index")
             ax.set_ylabel(column)
             ax.legend()
             ax.grid(True, alpha=0.3)
-        
+
         plt.tight_layout()
-        plt.show()
-    
-    def plot_multivariate_outliers(
-        self,
-        columns: Optional[List[str]] = None,
-        figsize: Tuple[int, int] = (12, 5)
-    ):
-        """
-        Visualize multivariate outlier detection.
-        
-        Args:
-            columns: Columns to use (first 2-3 numeric if None)
-            figsize: Figure size
-        """
+        finalize_plot(fig, out_path, show)
+
+    def plot_multivariate_outliers(self, columns: Optional[List[str]] = None, figsize: Tuple[int, int] = (12, 5),
+                                    out_path: Optional[str] = None, show: bool = True):
         cols = columns or self.numeric_cols[:3]
-        
         if len(cols) < 2:
-            print("Need at least 2 columns for multivariate outlier detection")
+            log.warning("Need at least 2 columns for multivariate outlier detection")
             return
-        
-        # Detect outliers
+        if len(cols) > 2:
+            # FIX: previously silently used only cols[0]/cols[1]; now explicit.
+            log.info("plot_multivariate_outliers: detection uses all %d columns %s, "
+                     "but the 2D scatter only visualizes '%s' vs '%s'.",
+                     len(cols), cols, cols[0], cols[1])
+
         iso_outliers = self.detect_isolation_forest_outliers(cols)
         maha_outliers = self.detect_mahalanobis_outliers(cols)
-        
+
         fig, axes = plt.subplots(1, 2, figsize=figsize)
-        
-        # Isolation Forest
-        ax = axes[0]
-        ax.scatter(
-            self.df.loc[~iso_outliers, cols[0]],
-            self.df.loc[~iso_outliers, cols[1]],
-            c='blue',
-            alpha=0.5,
-            s=20,
-            label='Normal'
-        )
-        ax.scatter(
-            self.df.loc[iso_outliers, cols[0]],
-            self.df.loc[iso_outliers, cols[1]],
-            c='red',
-            alpha=0.7,
-            s=50,
-            label='Outlier'
-        )
-        ax.set_title(f'Isolation Forest\n{iso_outliers.sum()} outliers')
-        ax.set_xlabel(cols[0])
-        ax.set_ylabel(cols[1])
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        # Mahalanobis
-        ax = axes[1]
-        ax.scatter(
-            self.df.loc[~maha_outliers, cols[0]],
-            self.df.loc[~maha_outliers, cols[1]],
-            c='blue',
-            alpha=0.5,
-            s=20,
-            label='Normal'
-        )
-        ax.scatter(
-            self.df.loc[maha_outliers, cols[0]],
-            self.df.loc[maha_outliers, cols[1]],
-            c='red',
-            alpha=0.7,
-            s=50,
-            label='Outlier'
-        )
-        ax.set_title(f'Mahalanobis Distance\n{maha_outliers.sum()} outliers')
-        ax.set_xlabel(cols[0])
-        ax.set_ylabel(cols[1])
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
+        for ax, outliers, title in zip(
+            axes, [iso_outliers, maha_outliers], ["Isolation Forest", "Mahalanobis Distance"]
+        ):
+            ax.scatter(self.df.loc[~outliers, cols[0]], self.df.loc[~outliers, cols[1]],
+                       c="blue", alpha=0.5, s=20, label="Normal")
+            ax.scatter(self.df.loc[outliers, cols[0]], self.df.loc[outliers, cols[1]],
+                       c="red", alpha=0.7, s=50, label="Outlier")
+            ax.set_title(f"{title}\n{outliers.sum()} outliers")
+            ax.set_xlabel(cols[0])
+            ax.set_ylabel(cols[1])
+            ax.legend()
+            ax.grid(True, alpha=0.3)
+
         plt.tight_layout()
-        plt.show()
-    
-    def analyze_outlier_impact(self, column: str) -> Dict:
-        """Analyze the impact of outliers on statistics."""
-        analysis = self.analyze_all_methods(column)
-        consensus_outliers = analysis['consensus']
-        
-        data_with = self.df[column]
-        data_without = self.df.loc[~consensus_outliers, column]
-        
-        impact = {
-            'column': column,
-            'mean_with_outliers': round(data_with.mean(), 4),
-            'mean_without_outliers': round(data_without.mean(), 4),
-            'mean_difference': round(data_with.mean() - data_without.mean(), 4),
-            'median_with_outliers': round(data_with.median(), 4),
-            'median_without_outliers': round(data_without.median(), 4),
-            'std_with_outliers': round(data_with.std(), 4),
-            'std_without_outliers': round(data_without.std(), 4)
-        }
-        
-        return impact
+        finalize_plot(fig, out_path, show)
 
 
-# Example usage
-if __name__ == "__main__":
-    # Create dataset with outliers
+# --------------------------------------------------------------------------
+def _demo_dataframe() -> pd.DataFrame:
     np.random.seed(42)
     n = 500
-    
-    # Normal data with injected outliers
-    normal_data = np.random.normal(50, 10, n-30)
+    normal_data = np.random.normal(50, 10, n - 30)
     outlier_data = np.random.uniform(120, 150, 30)
-    
     df = pd.DataFrame({
-        'feature1': np.concatenate([normal_data, outlier_data]),
-        'feature2': np.random.normal(100, 15, n),
-        'feature3': np.random.exponential(20, n),
-        'feature4': np.random.uniform(0, 100, n)
+        "feature1": np.concatenate([normal_data, outlier_data]),
+        "feature2": np.random.normal(100, 15, n),
+        "feature3": np.random.exponential(20, n),
+        "feature4": np.random.uniform(0, 100, n),
     })
-    
-    # Add some extreme outliers
-    df.loc[np.random.choice(df.index, 10), 'feature2'] = np.random.uniform(200, 250, 10)
-    
-    print("Sample Data:")
-    print(df.head())
-    print(f"\nShape: {df.shape}")
-    print("\n" + "="*70 + "\n")
-    
-    # Initialize suite
-    suite = OutlierSuite(df)
-    
-    # Compare methods across all columns
-    print("Outlier Detection Summary:")
-    summary = suite.compare_methods_all_columns()
-    print(summary.to_string(index=False))
-    print("\n" + "="*70 + "\n")
-    
-    # Analyze impact for specific column
-    print("Outlier Impact Analysis for 'feature1':")
-    impact = suite.analyze_outlier_impact('feature1')
-    for key, value in impact.items():
-        print(f"{key}: {value}")
-    print("\n" + "="*70 + "\n")
-    
-    # Visualizations
-    print("Generating outlier comparison plot...")
-    suite.plot_outlier_comparison('feature1')
-    
-    print("Generating multivariate outlier plot...")
-    suite.plot_multivariate_outliers(['feature1', 'feature2'])
+    df.loc[np.random.choice(df.index, 10, replace=False), "feature2"] = np.random.uniform(200, 250, 10)
+    return df
 
+
+def main(argv=None) -> int:
+    parser = build_base_arg_parser("Multi-method outlier detection & treatment for any CSV dataset.")
+    parser.add_argument("--consensus-min-methods", type=int, default=2)
+    parser.add_argument("--treat-column", default=None, help="Column to demonstrate outlier treatment on.")
+    parser.add_argument("--treat-strategy", default="cap", choices=["cap", "remove", "impute"])
+    args = parser.parse_args(argv)
+    show = not args.no_show
+
+    df = load_dataframe(args.input_csv, _demo_dataframe)
+    suite = OutlierSuite(df, consensus_min_methods=args.consensus_min_methods)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary = suite.compare_methods_all_columns()
+    summary.to_csv(out_dir / "outlier_summary.csv", index=False)
+    print("Outlier Detection Summary:")
+    print(summary.to_string(index=False))
+
+    first_col = suite.numeric_cols[0]
+    impact = suite.analyze_outlier_impact(first_col)
+    print(f"\nOutlier Impact Analysis for '{first_col}':")
+    for k, v in impact.items():
+        print(f"{k}: {v}")
+
+    treat_col = args.treat_column or first_col
+    treated = suite.treat_outliers(treat_col, strategy=args.treat_strategy)
+    pd.DataFrame({treat_col: df[treat_col], f"{treat_col}_treated": treated}).to_csv(
+        out_dir / f"{treat_col}_treated.csv", index=False
+    )
+
+    suite.plot_outlier_comparison(first_col, out_path=str(out_dir / "outlier_comparison.png"), show=show)
+    if len(suite.numeric_cols) >= 2:
+        suite.plot_multivariate_outliers(suite.numeric_cols[:2],
+                                          out_path=str(out_dir / "multivariate_outliers.png"), show=show)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

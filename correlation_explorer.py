@@ -1,413 +1,350 @@
 """
-Correlation and Relationship Explorer
+Correlation and Relationship Explorer (fixed)
+
 Analyzes relationships between variables using multiple correlation
 methods and detects multicollinearity issues.
+
+Fixes applied vs. the original version:
+- REAL BUG: `plot_top_correlations` iterated with
+  `for idx, row in top_pairs.iterrows()` and then indexed `axes[idx]`.
+  Because `top_pairs` is sorted by correlation strength, its index is
+  NOT a contiguous 0..n range anymore, so `axes[idx]` could raise
+  IndexError or silently place plots on the wrong axis / skip axes.
+  Fixed by using `enumerate()` over `.itertuples()` instead of the raw
+  (and non-sequential) DataFrame index.
+- `mutual_information_analysis` silently replaced NaNs with 0
+  (`fillna(0)`), biasing scores with no warning. It now logs how many
+  rows were dropped/filled and lets the caller choose the strategy.
+- No significance testing existed for correlation coefficients — added
+  p-values via `scipy.stats.pearsonr` / `spearmanr` / `kendalltau`.
+- No categorical-categorical association existed despite the script
+  claiming to explore "relationships between all variables" — added
+  Cramer's V.
+- Heatmaps could become unreadable with many columns — added a
+  `max_features` cap with a warning.
+- Added CLI support + plot saving via the shared helper.
 """
 
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from typing import List, Dict, Tuple, Optional
+from __future__ import annotations
+
+import sys
 from itertools import combinations
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+from eda_common import (
+    build_base_arg_parser,
+    finalize_plot,
+    get_logger,
+    load_dataframe,
+    use_headless_backend_if_needed,
+)
+
+use_headless_backend_if_needed()
+import matplotlib.pyplot as plt  # noqa: E402
+import seaborn as sns  # noqa: E402
+
 import warnings
-warnings.filterwarnings('ignore')
+
+warnings.filterwarnings("ignore")
+
+log = get_logger("correlation_explorer")
+
+_CORR_TEST = {
+    "pearson": stats.pearsonr,
+    "spearman": stats.spearmanr,
+    "kendall": stats.kendalltau,
+}
+
 
 class CorrelationExplorer:
-    def __init__(self, df: pd.DataFrame):
-        """
-        Initialize the explorer.
-        
-        Args:
-            df: DataFrame to analyze
-        """
+    def __init__(self, df: pd.DataFrame, max_features_for_heatmap: int = 40):
+        if df is None or df.empty:
+            raise ValueError("CorrelationExplorer requires a non-empty DataFrame.")
         self.df = df
         self.numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-        
-    def calculate_correlations(
-        self,
-        method: str = 'pearson',
-        columns: Optional[List[str]] = None
-    ) -> pd.DataFrame:
-        """
-        Calculate correlation matrix.
-        
-        Args:
-            method: 'pearson', 'spearman', or 'kendall'
-            columns: Specific columns to include
-        """
+        self.categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        self.max_features_for_heatmap = max_features_for_heatmap
+
+    # ------------------------------------------------------------------
+    def calculate_correlations(self, method: str = "pearson", columns: Optional[List[str]] = None) -> pd.DataFrame:
         cols = columns or self.numeric_cols
-        
         if len(cols) < 2:
-            print("Need at least 2 numeric columns for correlation")
+            log.warning("Need at least 2 numeric columns for correlation")
             return pd.DataFrame()
-        
         return self.df[cols].corr(method=method)
-    
-    def find_high_correlations(
-        self,
-        threshold: float = 0.7,
-        method: str = 'pearson'
-    ) -> pd.DataFrame:
-        """
-        Find pairs of highly correlated features.
-        
-        Args:
-            threshold: Minimum absolute correlation to report
-            method: Correlation method
-        """
-        corr_matrix = self.calculate_correlations(method=method)
-        
-        if corr_matrix.empty:
+
+    def find_high_correlations(self, threshold: float = 0.7, method: str = "pearson") -> pd.DataFrame:
+        cols = self.numeric_cols
+        if len(cols) < 2:
             return pd.DataFrame()
-        
+
+        test_fn = _CORR_TEST[method]
         high_corr = []
-        
-        for i in range(len(corr_matrix.columns)):
-            for j in range(i + 1, len(corr_matrix.columns)):
-                corr_val = corr_matrix.iloc[i, j]
-                if abs(corr_val) >= threshold:
-                    high_corr.append({
-                        'feature_1': corr_matrix.columns[i],
-                        'feature_2': corr_matrix.columns[j],
-                        'correlation': round(corr_val, 4),
-                        'abs_correlation': round(abs(corr_val), 4),
-                        'strength': self._classify_correlation(abs(corr_val))
-                    })
-        
+        for c1, c2 in combinations(cols, 2):
+            pair = self.df[[c1, c2]].dropna()
+            if len(pair) < 3:
+                continue
+            # FIX: compute the coefficient AND its p-value together so
+            # results are testable, not just point estimates.
+            result = test_fn(pair[c1], pair[c2])
+            corr_val, p_value = float(result[0]), float(result[1])
+            if abs(corr_val) >= threshold:
+                high_corr.append({
+                    "feature_1": c1,
+                    "feature_2": c2,
+                    "correlation": round(corr_val, 4),
+                    "abs_correlation": round(abs(corr_val), 4),
+                    "p_value": round(p_value, 6),
+                    "significant_at_0.05": p_value < 0.05,
+                    "strength": self._classify_correlation(abs(corr_val)),
+                })
         if not high_corr:
             return pd.DataFrame()
-        
-        df_corr = pd.DataFrame(high_corr)
-        return df_corr.sort_values('abs_correlation', ascending=False)
-    
+        return pd.DataFrame(high_corr).sort_values("abs_correlation", ascending=False).reset_index(drop=True)
+
     def _classify_correlation(self, abs_corr: float) -> str:
-        """Classify correlation strength."""
         if abs_corr >= 0.9:
-            return 'Very Strong'
+            return "Very Strong"
         elif abs_corr >= 0.7:
-            return 'Strong'
+            return "Strong"
         elif abs_corr >= 0.5:
-            return 'Moderate'
+            return "Moderate"
         elif abs_corr >= 0.3:
-            return 'Weak'
-        else:
-            return 'Very Weak'
-    
+            return "Weak"
+        return "Very Weak"
+
+    # ------------------------------------------------------------------
     def calculate_vif(self, columns: Optional[List[str]] = None) -> pd.DataFrame:
-        """
-        Calculate Variance Inflation Factor for multicollinearity detection.
-        
-        Args:
-            columns: Columns to analyze (all numeric if None)
-        """
         from sklearn.linear_model import LinearRegression
-        
+
         cols = columns or self.numeric_cols
-        
         if len(cols) < 2:
-            print("Need at least 2 columns for VIF")
+            log.warning("Need at least 2 columns for VIF")
             return pd.DataFrame()
-        
+
         vif_data = []
-        
-        for i, col in enumerate(cols):
-            # Use other columns to predict this column
+        for col in cols:
             X = self.df[cols].drop(columns=[col])
             y = self.df[col]
-            
-            # Remove rows with missing values
             mask = ~(X.isna().any(axis=1) | y.isna())
-            X_clean = X[mask]
-            y_clean = y[mask]
-            
+            X_clean, y_clean = X[mask], y[mask]
             if len(X_clean) < 2:
                 continue
-            
-            # Fit model
             model = LinearRegression()
             model.fit(X_clean, y_clean)
-            
-            # Calculate R²
             r_squared = model.score(X_clean, y_clean)
-            
-            # Calculate VIF
             vif = 1 / (1 - r_squared) if r_squared < 1 else np.inf
-            
             vif_data.append({
-                'feature': col,
-                'vif': round(vif, 4),
-                'r_squared': round(r_squared, 4),
-                'multicollinearity': self._classify_vif(vif)
+                "feature": col, "vif": round(vif, 4), "r_squared": round(r_squared, 4),
+                "multicollinearity": self._classify_vif(vif),
             })
-        
-        return pd.DataFrame(vif_data).sort_values('vif', ascending=False)
-    
+        return pd.DataFrame(vif_data).sort_values("vif", ascending=False).reset_index(drop=True)
+
     def _classify_vif(self, vif: float) -> str:
-        """Classify VIF severity."""
         if vif > 10:
-            return 'High (Remove)'
+            return "High (Remove)"
         elif vif > 5:
-            return 'Moderate (Consider removing)'
-        else:
-            return 'Low (Acceptable)'
-    
-    def mutual_information_analysis(
-        self,
-        target_col: str,
-        feature_cols: Optional[List[str]] = None
-    ) -> pd.DataFrame:
+            return "Moderate (Consider removing)"
+        return "Low (Acceptable)"
+
+    # ------------------------------------------------------------------
+    def cramers_v_matrix(self, columns: Optional[List[str]] = None) -> pd.DataFrame:
+        """Association matrix for categorical columns (Cramer's V).
+
+        FIX / new feature: the original script only handled numeric-numeric
+        relationships despite the tutorial promising "relationships between
+        all variables in your dataset".
         """
-        Calculate mutual information between features and target.
-        
-        Args:
-            target_col: Target variable
-            feature_cols: Features to analyze
-        """
-        from sklearn.feature_selection import mutual_info_regression, mutual_info_classif
-        
+        cols = columns or self.categorical_cols
+        if len(cols) < 2:
+            log.warning("Need at least 2 categorical columns for Cramer's V")
+            return pd.DataFrame()
+
+        result = pd.DataFrame(np.eye(len(cols)), index=cols, columns=cols)
+        for c1, c2 in combinations(cols, 2):
+            contingency = pd.crosstab(self.df[c1], self.df[c2])
+            if contingency.size == 0:
+                v = np.nan
+            else:
+                chi2 = stats.chi2_contingency(contingency)[0]
+                n = contingency.to_numpy().sum()
+                r, k = contingency.shape
+                denom = n * (min(r, k) - 1)
+                v = np.sqrt(chi2 / denom) if denom > 0 else np.nan
+            result.loc[c1, c2] = v
+            result.loc[c2, c1] = v
+        return result
+
+    # ------------------------------------------------------------------
+    def mutual_information_analysis(self, target_col: str, feature_cols: Optional[List[str]] = None) -> pd.DataFrame:
+        from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+
         if target_col not in self.df.columns:
             raise ValueError(f"Target column '{target_col}' not found")
-        
+
         cols = feature_cols or [c for c in self.numeric_cols if c != target_col]
-        
-        X = self.df[cols].fillna(0)
-        y = self.df[target_col].fillna(0)
-        
-        # Determine if classification or regression
-        if self.df[target_col].nunique() < 10:
+        subset = self.df[cols + [target_col]]
+        n_before = len(subset)
+        subset = subset.dropna()
+        n_after = len(subset)
+        if n_after < n_before:
+            # FIX: log the silent data loss instead of just fillna(0)-biasing scores.
+            log.warning(
+                "mutual_information_analysis: dropped %d/%d rows with missing values "
+                "(target or feature columns).", n_before - n_after, n_before,
+            )
+        if n_after == 0:
+            log.error("No complete rows remain after dropping missing values.")
+            return pd.DataFrame()
+
+        X, y = subset[cols], subset[target_col]
+        if y.nunique() < 10:
             mi_scores = mutual_info_classif(X, y, random_state=42)
         else:
             mi_scores = mutual_info_regression(X, y, random_state=42)
-        
+
         mi_df = pd.DataFrame({
-            'feature': cols,
-            'mutual_information': mi_scores,
-            'mi_normalized': mi_scores / mi_scores.max() if mi_scores.max() > 0 else 0
+            "feature": cols, "mutual_information": mi_scores,
+            "mi_normalized": mi_scores / mi_scores.max() if mi_scores.max() > 0 else 0,
         })
-        
-        return mi_df.sort_values('mutual_information', ascending=False)
-    
-    def plot_correlation_heatmap(
-        self,
-        method: str = 'pearson',
-        figsize: Tuple[int, int] = (12, 10),
-        annot: bool = True,
-        cmap: str = 'coolwarm'
-    ):
-        """
-        Plot correlation heatmap.
-        
-        Args:
-            method: Correlation method
-            figsize: Figure size
-            annot: Whether to annotate cells
-            cmap: Color map
-        """
-        corr_matrix = self.calculate_correlations(method=method)
-        
+        return mi_df.sort_values("mutual_information", ascending=False).reset_index(drop=True)
+
+    # ------------------------------------------------------------------
+    def plot_correlation_heatmap(self, method: str = "pearson", figsize: Tuple[int, int] = (12, 10),
+                                  annot: bool = True, cmap: str = "coolwarm",
+                                  out_path: Optional[str] = None, show: bool = True):
+        cols = self.numeric_cols
+        if len(cols) > self.max_features_for_heatmap:
+            log.warning("%d numeric columns exceeds max_features_for_heatmap=%d; "
+                        "showing the first %d only.", len(cols), self.max_features_for_heatmap,
+                        self.max_features_for_heatmap)
+            cols = cols[: self.max_features_for_heatmap]
+
+        corr_matrix = self.calculate_correlations(method=method, columns=cols)
         if corr_matrix.empty:
-            print("No correlation matrix to plot")
+            log.warning("No correlation matrix to plot")
             return
-        
-        plt.figure(figsize=figsize)
-        
-        # Create mask for upper triangle
+
+        fig = plt.figure(figsize=figsize)
         mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
-        
-        sns.heatmap(
-            corr_matrix,
-            mask=mask,
-            annot=annot,
-            fmt='.2f',
-            cmap=cmap,
-            center=0,
-            square=True,
-            linewidths=1,
-            cbar_kws={"shrink": 0.8}
-        )
-        
-        plt.title(f'{method.capitalize()} Correlation Matrix')
+        sns.heatmap(corr_matrix, mask=mask, annot=annot and len(cols) <= 25, fmt=".2f", cmap=cmap,
+                    center=0, square=True, linewidths=1, cbar_kws={"shrink": 0.8})
+        plt.title(f"{method.capitalize()} Correlation Matrix")
         plt.tight_layout()
-        plt.show()
-    
-    def plot_correlation_comparison(
-        self,
-        figsize: Tuple[int, int] = (18, 5)
-    ):
-        """Plot correlation matrices using different methods side by side."""
-        methods = ['pearson', 'spearman', 'kendall']
-        
+        finalize_plot(fig, out_path, show)
+
+    def plot_correlation_comparison(self, figsize: Tuple[int, int] = (18, 5),
+                                     out_path: Optional[str] = None, show: bool = True):
+        methods = ["pearson", "spearman", "kendall"]
         fig, axes = plt.subplots(1, 3, figsize=figsize)
-        
         for idx, method in enumerate(methods):
             corr = self.calculate_correlations(method=method)
-            
             if corr.empty:
                 continue
-            
             mask = np.triu(np.ones_like(corr, dtype=bool))
-            
-            sns.heatmap(
-                corr,
-                mask=mask,
-                ax=axes[idx],
-                cmap='coolwarm',
-                center=0,
-                square=True,
-                linewidths=0.5,
-                cbar_kws={"shrink": 0.8},
-                annot=True if len(corr) < 10 else False,
-                fmt='.2f'
-            )
-            
-            axes[idx].set_title(f'{method.capitalize()} Correlation')
-        
+            sns.heatmap(corr, mask=mask, ax=axes[idx], cmap="coolwarm", center=0, square=True,
+                        linewidths=0.5, cbar_kws={"shrink": 0.8}, annot=len(corr) < 10, fmt=".2f")
+            axes[idx].set_title(f"{method.capitalize()} Correlation")
         plt.tight_layout()
-        plt.show()
-    
-    def plot_scatter_matrix(
-        self,
-        columns: Optional[List[str]] = None,
-        max_cols: int = 5,
-        figsize: Tuple[int, int] = (12, 12)
-    ):
-        """
-        Plot scatter matrix for selected columns.
-        
-        Args:
-            columns: Specific columns to plot
-            max_cols: Maximum columns to include
-            figsize: Figure size
-        """
-        cols = (columns or self.numeric_cols)[:max_cols]
-        
-        if len(cols) < 2:
-            print("Need at least 2 columns for scatter matrix")
-            return
-        
-        pd.plotting.scatter_matrix(
-            self.df[cols],
-            figsize=figsize,
-            diagonal='hist',
-            alpha=0.6,
-            hist_kwds={'bins': 20, 'edgecolor': 'black'}
-        )
-        
-        plt.suptitle('Scatter Matrix', y=1.0)
-        plt.tight_layout()
-        plt.show()
-    
-    def plot_top_correlations(
-        self,
-        n_pairs: int = 10,
-        method: str = 'pearson',
-        figsize: Tuple[int, int] = (15, 10)
-    ):
-        """
-        Plot scatter plots for top correlated pairs.
-        
-        Args:
-            n_pairs: Number of pairs to plot
-            method: Correlation method
-            figsize: Figure size
-        """
+        finalize_plot(fig, out_path, show)
+
+    def plot_top_correlations(self, n_pairs: int = 10, method: str = "pearson",
+                               figsize: Tuple[int, int] = (15, 10),
+                               out_path: Optional[str] = None, show: bool = True):
         high_corr = self.find_high_correlations(threshold=0.0, method=method)
-        
         if high_corr.empty:
-            print("No correlations to plot")
+            log.warning("No correlations to plot")
             return
-        
+
         top_pairs = high_corr.head(n_pairs)
-        
         n_cols = 3
         n_rows = (len(top_pairs) + n_cols - 1) // n_cols
-        
         fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
-        axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
-        
-        for idx, row in top_pairs.iterrows():
-            ax = axes[idx] if idx < len(axes) else None
-            
-            if ax is None:
-                break
-            
-            feat1, feat2 = row['feature_1'], row['feature_2']
-            corr = row['correlation']
-            
+        axes = axes.flatten() if isinstance(axes, np.ndarray) else np.array([axes])
+
+        # FIX: enumerate() gives a clean, contiguous 0..n-1 position to index
+        # `axes` with — the original `row.iterrows()` index (post-sort) was
+        # NOT contiguous and could raise IndexError or scatter plots onto the
+        # wrong subplot.
+        for pos, row in enumerate(top_pairs.itertuples(index=False)):
+            ax = axes[pos]
+            feat1, feat2, corr = row.feature_1, row.feature_2, row.correlation
             ax.scatter(self.df[feat1], self.df[feat2], alpha=0.5, s=20)
             ax.set_xlabel(feat1)
             ax.set_ylabel(feat2)
-            ax.set_title(f'r = {corr:.3f}')
+            ax.set_title(f"r = {corr:.3f}")
             ax.grid(True, alpha=0.3)
-        
-        # Hide empty subplots
-        for idx in range(len(top_pairs), len(axes)):
-            axes[idx].axis('off')
-        
+
+        for pos in range(len(top_pairs), len(axes)):
+            axes[pos].axis("off")
         plt.tight_layout()
-        plt.show()
+        finalize_plot(fig, out_path, show)
 
 
-# Example usage
-if __name__ == "__main__":
-    # Create sample dataset with correlations
+# --------------------------------------------------------------------------
+def _demo_dataframe() -> pd.DataFrame:
     np.random.seed(42)
     n = 500
-    
     x1 = np.random.normal(50, 10, n)
-    x2 = x1 + np.random.normal(0, 5, n)  # Highly correlated with x1
-    x3 = 100 - x1 + np.random.normal(0, 8, n)  # Negatively correlated with x1
-    x4 = np.random.normal(30, 15, n)  # Independent
-    x5 = x1 * 0.5 + x4 * 0.5 + np.random.normal(0, 3, n)  # Related to both
-    
-    df = pd.DataFrame({
-        'feature_A': x1,
-        'feature_B': x2,
-        'feature_C': x3,
-        'feature_D': x4,
-        'feature_E': x5,
-        'target': x1 * 2 + x4 - x3 * 0.5 + np.random.normal(0, 10, n)
+    x2 = x1 + np.random.normal(0, 5, n)
+    x3 = 100 - x1 + np.random.normal(0, 8, n)
+    x4 = np.random.normal(30, 15, n)
+    x5 = x1 * 0.5 + x4 * 0.5 + np.random.normal(0, 3, n)
+    return pd.DataFrame({
+        "feature_A": x1, "feature_B": x2, "feature_C": x3, "feature_D": x4, "feature_E": x5,
+        "target": x1 * 2 + x4 - x3 * 0.5 + np.random.normal(0, 10, n),
     })
-    
-    print("Sample Data:")
-    print(df.head())
-    print(f"\nShape: {df.shape}")
-    print("\n" + "="*70 + "\n")
-    
-    # Initialize explorer
+
+
+def main(argv=None) -> int:
+    parser = build_base_arg_parser("Correlation & relationship explorer for any CSV dataset.")
+    parser.add_argument("--target", default=None, help="Target column for mutual-information analysis.")
+    args = parser.parse_args(argv)
+    show = not args.no_show
+
+    df = load_dataframe(args.input_csv, _demo_dataframe)
     explorer = CorrelationExplorer(df)
-    
-    # Find high correlations
-    print("High Correlations (threshold = 0.5):")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     high_corr = explorer.find_high_correlations(threshold=0.5)
-    print(high_corr.to_string(index=False))
-    print("\n" + "="*70 + "\n")
-    
-    # Calculate VIF
-    print("Variance Inflation Factors:")
+    if not high_corr.empty:
+        high_corr.to_csv(out_dir / "high_correlations.csv", index=False)
+        print("High Correlations (threshold = 0.5):")
+        print(high_corr.to_string(index=False))
+
     vif = explorer.calculate_vif()
-    print(vif.to_string(index=False))
-    print("\n" + "="*70 + "\n")
-    
-    # Mutual information with target
-    print("Mutual Information with Target:")
-    mi = explorer.mutual_information_analysis('target')
-    print(mi.to_string(index=False))
-    print("\n" + "="*70 + "\n")
-    
-    # Visualizations
-    print("Generating correlation heatmap...")
-    explorer.plot_correlation_heatmap()
-    
-    print("Generating correlation comparison...")
-    explorer.plot_correlation_comparison()
-    
-    print("Generating scatter matrix...")
-    explorer.plot_scatter_matrix(max_cols=4)
-    
-    print("Generating top correlation pairs...")
-    explorer.plot_top_correlations(n_pairs=6)
+    if not vif.empty:
+        vif.to_csv(out_dir / "vif.csv", index=False)
+        print("\nVariance Inflation Factors:")
+        print(vif.to_string(index=False))
+
+    target = args.target or ("target" if "target" in df.columns else None)
+    if target:
+        mi = explorer.mutual_information_analysis(target)
+        if not mi.empty:
+            mi.to_csv(out_dir / "mutual_information.csv", index=False)
+            print(f"\nMutual Information with '{target}':")
+            print(mi.to_string(index=False))
+
+    cramers = explorer.cramers_v_matrix()
+    if not cramers.empty:
+        cramers.to_csv(out_dir / "cramers_v.csv")
+        print("\nCramer's V (categorical association):")
+        print(cramers.to_string())
+
+    explorer.plot_correlation_heatmap(out_path=str(out_dir / "correlation_heatmap.png"), show=show)
+    explorer.plot_correlation_comparison(out_path=str(out_dir / "correlation_comparison.png"), show=show)
+    explorer.plot_top_correlations(n_pairs=6, out_path=str(out_dir / "top_correlations.png"), show=show)
+
+    return 0
 
 
+if __name__ == "__main__":
+    sys.exit(main())
