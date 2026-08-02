@@ -178,22 +178,34 @@ python correlation_explorer.py sales.parquet --target revenue --output-dir out
 ```
 
 ### `outlier_suite.py`
-
+ 
 ```bash
 python outlier_suite.py [input_path] [--consensus-min-methods 2] \
-    [--treat-column COLUMN] [--treat-strategy {cap,remove,impute}] [shared options]
+    [--treat-column COLUMN|all] [--treat-strategy {cap,remove,impute}] [shared options]
 ```
 - `--consensus-min-methods` (default `2`): how many of the 3 detectors
   (IQR, z-score, modified z-score) must flag a row for it to count as
   a "consensus" outlier.
-- `--treat-column` (default: first numeric column): column to
-  demonstrate outlier treatment on.
+- `--treat-column` (default: `all`): column to treat, or `all` to
+  treat every numeric column at once.
 - `--treat-strategy` (default `cap`): `cap` (winsorize to IQR bounds),
   `remove` (set to NaN), or `impute` (replace with the median).
+- Impact analysis (`outlier_impact_all_columns.csv`) always covers
+  **every** numeric column, ranked by relative mean shift (the biggest
+  % change in the mean once consensus outliers are excluded).
 - Output: `reports/outlier_suite/` (`outlier_summary.csv`,
+  `outlier_impact_all_columns.csv`, and either — in `all` mode (the
+  default) — `treatment_summary_all_columns.csv` +
+  `dataset_treated_all_columns.csv`, or — for a specific column —
   `<column>_treated.csv`) and `plots/outlier_suite/`
-  (`outlier_comparison.png`, `multivariate_outliers.png`).
-
+  (`multivariate_outliers.png` always; plus, in `all` mode,
+  `consensus_outliers_all_columns.png` (one subplot per column), or
+  for a specific column, `outlier_comparison_<column>.png` — a
+  detailed 4-method breakdown for just that column).
+```bash
+python outlier_suite.py transactions.csv --treat-column all --treat-strategy impute --output-dir out
+```
+ 
 ```bash
 python outlier_suite.py transactions.json --treat-column amount --treat-strategy remove --output-dir out
 ```

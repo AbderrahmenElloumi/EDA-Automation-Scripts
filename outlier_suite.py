@@ -36,6 +36,7 @@ from sklearn.ensemble import IsolationForest
 
 from eda_common import (
     build_base_arg_parser,
+    create_grid,
     finalize_plot,
     get_logger,
     get_output_dirs,
@@ -150,16 +151,35 @@ class OutlierSuite:
         consensus_outliers = analysis["consensus"]
         data_with = self.df[column]
         data_without = self.df.loc[~consensus_outliers, column]
+        mean_with, mean_without = data_with.mean(), data_without.mean()
+        # Relative shift lets columns on very different scales (e.g. age vs.
+        # income) be compared and ranked fairly — see analyze_outlier_impact_all_columns.
+        relative_shift_pct = (
+            abs(mean_with - mean_without) / abs(mean_without) * 100 if mean_without else np.nan
+        )
         return {
             "column": column,
-            "mean_with_outliers": round(data_with.mean(), 4),
-            "mean_without_outliers": round(data_without.mean(), 4),
-            "mean_difference": round(data_with.mean() - data_without.mean(), 4),
+            "consensus_outlier_count": int(consensus_outliers.sum()),
+            "mean_with_outliers": round(mean_with, 4),
+            "mean_without_outliers": round(mean_without, 4),
+            "mean_difference": round(mean_with - mean_without, 4),
+            "relative_mean_shift_pct": round(relative_shift_pct, 2) if pd.notna(relative_shift_pct) else None,
             "median_with_outliers": round(data_with.median(), 4),
             "median_without_outliers": round(data_without.median(), 4),
             "std_with_outliers": round(data_with.std(), 4),
             "std_without_outliers": round(data_without.std(), 4),
         }
+
+    def analyze_outlier_impact_all_columns(self) -> pd.DataFrame:
+        """Impact analysis for every numeric column, ranked by relative
+        mean shift so the columns most distorted by outliers surface
+        first. Previously only the first numeric column was analyzed.
+        """
+        rows = [self.analyze_outlier_impact(c) for c in self.numeric_cols]
+        if not rows:
+            return pd.DataFrame()
+        result = pd.DataFrame(rows)
+        return result.sort_values("relative_mean_shift_pct", ascending=False, na_position="last").reset_index(drop=True)
 
     # ------------------------------------------------------------------
     def treat_outliers(self, column: str, strategy: str = "cap", method: str = "iqr",
@@ -197,6 +217,34 @@ class OutlierSuite:
 
         return series
 
+    def treat_outliers_all_columns(self, strategy: str = "cap", method: str = "iqr",
+                                    iqr_mult: float = 1.5) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Apply treat_outliers() to every numeric column at once.
+
+        Returns (treated_df, summary_df). treated_df is a copy of the full
+        DataFrame with every numeric column treated; summary_df reports how
+        many rows were flagged per column, ordered by the largest share
+        flagged first (the columns treatment affects most).
+        """
+        treated_df = self.df.copy()
+        summary_rows = []
+        for col in self.numeric_cols:
+            treated_series = self.treat_outliers(col, strategy=strategy, method=method, iqr_mult=iqr_mult)
+            treated_df[col] = treated_series
+            if method == "iqr":
+                mask = self.detect_iqr_outliers(col, iqr_mult)
+            else:
+                mask = self.analyze_all_methods(col, iqr_mult=iqr_mult)[method]
+            summary_rows.append({
+                "column": col,
+                "rows_flagged": int(mask.sum()),
+                "pct_flagged": round(mask.mean() * 100, 2),
+                "strategy": strategy,
+                "method": method,
+            })
+        summary_df = pd.DataFrame(summary_rows).sort_values("pct_flagged", ascending=False).reset_index(drop=True)
+        return treated_df, summary_df
+
     # ------------------------------------------------------------------
     def plot_outlier_comparison(self, column: str, out_path: Optional[str] = None, show: bool = True):
         analysis = self.analyze_all_methods(column)
@@ -217,6 +265,38 @@ class OutlierSuite:
             ax.legend()
             ax.grid(True, alpha=0.3)
 
+        finalize_plot(fig, out_path, show)
+
+    def plot_consensus_outliers_all_columns(self, out_path: Optional[str] = None, show: bool = True):
+        """One scatter subplot per numeric column, showing consensus
+        outliers. Companion to `plot_outlier_comparison` (which drills
+        into all 4 detection methods for a *single* column): this gives
+        the "all columns" overview that was previously missing — the
+        plots used to always show only the first column regardless of
+        how many columns were actually analyzed/treated.
+        """
+        cols = self.numeric_cols
+        if not cols:
+            log.warning("No numeric columns to plot")
+            return
+        n_cols = min(3, len(cols))
+        fig, axes, _ = create_grid(len(cols), n_cols, per_row_height=3.4)
+
+        for idx, col in enumerate(cols):
+            ax = axes[idx]
+            outliers = self.analyze_all_methods(col)["consensus"]
+            data = self.df[col]
+            ax.scatter(data.index[~outliers], data[~outliers], c="blue", alpha=0.5, s=15, label="Normal")
+            ax.scatter(data.index[outliers], data[outliers], c="red", alpha=0.7, s=35, label="Outlier")
+            ax.set_title(f"{col}\n{outliers.sum()} outliers ({outliers.mean() * 100:.1f}%)", fontsize=10)
+            ax.set_xlabel("Index", fontsize=9)
+            ax.set_ylabel(col, fontsize=9)
+            ax.legend(fontsize=8)
+            ax.tick_params(labelsize=8)
+            ax.grid(True, alpha=0.3)
+
+        for idx in range(len(cols), len(axes)):
+            axes[idx].axis("off")
         finalize_plot(fig, out_path, show)
 
     def plot_multivariate_outliers(self, columns: Optional[List[str]] = None,
@@ -269,7 +349,8 @@ def _demo_dataframe() -> pd.DataFrame:
 def main(argv=None) -> int:
     parser = build_base_arg_parser("Multi-method outlier detection & treatment for any dataset.")
     parser.add_argument("--consensus-min-methods", type=int, default=2)
-    parser.add_argument("--treat-column", default=None, help="Column to demonstrate outlier treatment on.")
+    parser.add_argument("--treat-column", default="all",
+                         help="Column to treat, or 'all' (default) to treat every numeric column at once.")
     parser.add_argument("--treat-strategy", default="cap", choices=["cap", "remove", "impute"])
     args = parser.parse_args(argv)
     show = not args.no_show
@@ -284,19 +365,42 @@ def main(argv=None) -> int:
     print("Outlier Detection Summary:")
     print(summary.to_string(index=False))
 
-    first_col = suite.numeric_cols[0]
-    impact = suite.analyze_outlier_impact(first_col)
-    print(f"\nOutlier Impact Analysis for '{first_col}':")
-    for k, v in impact.items():
-        print(f"{k}: {v}")
+    # FIX: impact analysis now covers every numeric column (previously only
+    # the first one), ranked by relative mean shift so the most-affected
+    # columns are easy to spot at the top.
+    impact_all = suite.analyze_outlier_impact_all_columns()
+    if not impact_all.empty:
+        impact_all.to_csv(reports_dir / "outlier_impact_all_columns.csv", index=False)
+        print("\nOutlier Impact Analysis (all numeric columns, ranked by relative mean shift):")
+        print(impact_all.to_string(index=False))
 
-    treat_col = args.treat_column or first_col
-    treated = suite.treat_outliers(treat_col, strategy=args.treat_strategy)
-    pd.DataFrame({treat_col: df[treat_col], f"{treat_col}_treated": treated}).to_csv(
-        reports_dir / f"{treat_col}_treated.csv", index=False
-    )
+    if args.treat_column == "all":
+        treated_df, treat_summary = suite.treat_outliers_all_columns(strategy=args.treat_strategy)
+        treat_summary.to_csv(reports_dir / "treatment_summary_all_columns.csv", index=False)
+        treated_df.to_csv(reports_dir / "dataset_treated_all_columns.csv", index=False)
+        print(f"\nTreatment summary ({args.treat_strategy}, all columns):")
+        print(treat_summary.to_string(index=False))
+    else:
+        treat_col = args.treat_column
+        if treat_col not in suite.numeric_cols:
+            log.error("'--treat-column %s' is not a numeric column. Available: %s",
+                      treat_col, suite.numeric_cols)
+            return 1
+        treated = suite.treat_outliers(treat_col, strategy=args.treat_strategy)
+        pd.DataFrame({treat_col: df[treat_col], f"{treat_col}_treated": treated}).to_csv(
+            reports_dir / f"{treat_col}_treated.csv", index=False
+        )
 
-    suite.plot_outlier_comparison(first_col, out_path=str(plots_dir / "outlier_comparison.png"), show=show)
+    if args.treat_column == "all":
+        # FIX: previously plot_outlier_comparison() always plotted only
+        # `first_col`, even in "all columns" mode. Now the plot set matches
+        # the report set: one consensus-outlier subplot per numeric column.
+        suite.plot_consensus_outliers_all_columns(
+            out_path=str(plots_dir / "consensus_outliers_all_columns.png"), show=show)
+    else:
+        suite.plot_outlier_comparison(treat_col, out_path=str(plots_dir / f"outlier_comparison_{treat_col}.png"),
+                                       show=show)
+
     if len(suite.numeric_cols) >= 2:
         suite.plot_multivariate_outliers(suite.numeric_cols[:2],
                                           out_path=str(plots_dir / "multivariate_outliers.png"), show=show)
