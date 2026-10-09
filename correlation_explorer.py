@@ -41,6 +41,9 @@ from eda_common import (
     load_dataframe,
     use_headless_backend_if_needed,
 )
+from eda_stats import (
+    classify_correlation_strength,
+)
 
 use_headless_backend_if_needed()
 import matplotlib.pyplot as plt  # noqa: E402
@@ -100,22 +103,13 @@ class CorrelationExplorer:
                     "abs_correlation": round(abs(corr_val), 4),
                     "p_value": round(p_value, 6),
                     "significant_at_0.05": p_value < 0.05,
-                    "strength": self._classify_correlation(abs(corr_val)),
+                    "strength": classify_correlation_strength(abs(corr_val)),
                 })
         if not high_corr:
             return pd.DataFrame()
         return pd.DataFrame(high_corr).sort_values("abs_correlation", ascending=False).reset_index(drop=True)
 
-    def _classify_correlation(self, abs_corr: float) -> str:
-        if abs_corr >= 0.9:
-            return "Very Strong"
-        elif abs_corr >= 0.7:
-            return "Strong"
-        elif abs_corr >= 0.5:
-            return "Moderate"
-        elif abs_corr >= 0.3:
-            return "Weak"
-        return "Very Weak"
+    # (classify_correlation_strength imported from eda_stats)
 
     # ------------------------------------------------------------------
     def calculate_vif(self, columns: Optional[List[str]] = None) -> pd.DataFrame:

@@ -53,6 +53,9 @@ from eda_common import (
     truncate_label,
     use_headless_backend_if_needed,
 )
+from eda_stats import (
+    classify_distribution_shape,
+)
 
 use_headless_backend_if_needed()
 import matplotlib.pyplot as plt  # noqa: E402
@@ -99,7 +102,7 @@ class DistributionAnalyzer:
             is_normal = result.statistic < result.critical_values[2]
             p_value = None
 
-        dist_type = self._classify_distribution(skewness, kurtosis, is_normal)
+        dist_type = classify_distribution_shape(skewness, kurtosis, is_normal)
         outlier_mask = iqr_outlier_mask(series)
         outliers = int(outlier_mask.sum())
 
@@ -119,18 +122,7 @@ class DistributionAnalyzer:
             "outlier_percentage": round(outliers / len(series) * 100, 2),
         }
 
-    def _classify_distribution(self, skew: float, kurt: float, is_normal: bool) -> str:
-        if is_normal and abs(skew) < 0.5:
-            return "Normal"
-        elif skew > 1:
-            return "Right-skewed (Positive)"
-        elif skew < -1:
-            return "Left-skewed (Negative)"
-        elif abs(skew) < 0.5 and kurt > 3:
-            return "Leptokurtic (Heavy-tailed)"
-        elif abs(skew) < 0.5 and kurt < 0:
-            return "Platykurtic (Light-tailed)"
-        return "Approximately symmetric"
+    # (classify_distribution_shape imported from eda_stats)
 
     def analyze_categorical_distribution(self, col: str) -> Dict[str, Any]:
         series = self.df[col].dropna()
