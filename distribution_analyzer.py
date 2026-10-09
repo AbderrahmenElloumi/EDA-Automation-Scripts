@@ -42,7 +42,6 @@ import pandas as pd
 from scipy import stats
 
 from eda_common import (
-    bucket_top_n,
     build_base_arg_parser,
     create_grid,
     finalize_plot,
@@ -54,6 +53,7 @@ from eda_common import (
     use_headless_backend_if_needed,
 )
 from eda_stats import (
+    bucket_top_n,
     classify_distribution_shape,
 )
 
