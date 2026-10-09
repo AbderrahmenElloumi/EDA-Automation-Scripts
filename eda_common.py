@@ -61,49 +61,16 @@ log = get_logger("eda_common")
 # --------------------------------------------------------------------------
 # Shared statistics
 # --------------------------------------------------------------------------
-def iqr_bounds(series: pd.Series, multiplier: float = 1.5) -> Tuple[float, float]:
-    """Return (lower_bound, upper_bound) for the IQR outlier rule."""
-    clean = series.dropna()
-    if clean.empty:
-        return (np.nan, np.nan)
-    q1 = clean.quantile(0.25)
-    q3 = clean.quantile(0.75)
-    iqr = q3 - q1
-    return (q1 - multiplier * iqr, q3 + multiplier * iqr)
-
-
-def iqr_outlier_mask(series: pd.Series, multiplier: float = 1.5) -> pd.Series:
-    """Boolean mask (aligned to series.index) flagging IQR outliers."""
-    lower, upper = iqr_bounds(series, multiplier)
-    mask = pd.Series(False, index=series.index)
-    if pd.isna(lower):
-        return mask
-    valid = series.notna()
-    mask.loc[valid] = (series[valid] < lower) | (series[valid] > upper)
-    return mask
-
-
-def bucket_top_n(value_counts: pd.Series, n: int = 15) -> Tuple[pd.Series, int, float]:
-    """Collapse a value_counts() Series into its top-n entries + 'Other'.
-
-    Returns (bucketed_series, n_categories_in_other, coverage_fraction)
-    where coverage_fraction is the share of total observations shown
-    explicitly (i.e. not folded into 'Other').
-
-    This replaces the previous behavior of plotting every category
-    (sometimes 1000+) as its own bar, which was unreadable and, for
-    near-uniform high-cardinality columns (like IDs or raw date
-    strings), visually meaningless.
-    """
-    total = value_counts.sum()
-    if len(value_counts) <= n or total == 0:
-        return value_counts, 0, 1.0
-    top = value_counts.iloc[:n]
-    other_count = value_counts.iloc[n:].sum()
-    other_n = len(value_counts) - n
-    bucketed = pd.concat([top, pd.Series({f"Other ({other_n} categories)": other_count})])
-    coverage = top.sum() / total
-    return bucketed, other_n, coverage
+from eda_stats import (
+    calculate_summary_stats,
+    iqr_bounds,
+    iqr_outlier_mask,
+    detect_outliers_zscore,
+    detect_outliers_modified_zscore,
+    classify_correlation_strength,
+    classify_distribution_shape,
+    bucket_top_n,
+)
 
 
 def truncate_label(label: Any, max_len: int = 22) -> str:

@@ -13,6 +13,12 @@ from eda_stats import (
 )
 
 class TestEdaStatsComplete(unittest.TestCase):
+    def test_iqr_bounds_empty(self):
+        s = pd.Series([], dtype=float)
+        lower, upper = iqr_bounds(s)
+        self.assertTrue(pd.isna(lower))
+        self.assertTrue(pd.isna(upper))
+
     def test_iqr_bounds(self):
         s = pd.Series([1, 2, 3, 4, 100]) # 100 is outlier
         lower, upper = iqr_bounds(s)

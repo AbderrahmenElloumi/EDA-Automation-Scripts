@@ -40,10 +40,12 @@ from eda_common import (
     finalize_plot,
     get_logger,
     get_output_dirs,
-    iqr_bounds,
-    iqr_outlier_mask,
     load_dataframe,
     use_headless_backend_if_needed,
+)
+from eda_stats import (
+    iqr_bounds,
+    iqr_outlier_mask,
 )
 
 use_headless_backend_if_needed()
