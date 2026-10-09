@@ -38,7 +38,15 @@ def iqr_outlier_mask(series: pd.Series, multiplier: float = 1.5) -> pd.Series:
     return mask
 
 def detect_outliers_zscore(series: pd.Series, threshold: float = 3.0) -> pd.Series:
-    """Boolean mask flagging Z-score outliers."""
+    """Boolean mask flagging Z-score outliers.
+
+    Args:
+        series (pd.Series): Input numeric series.
+        threshold (float): Z-score threshold for outlier detection. Defaults to 3.0.
+
+    Returns:
+        pd.Series: Boolean mask aligned to series.index flagging outliers.
+    """
     non_null = series.dropna()
     mask = pd.Series(False, index=series.index)
     if non_null.empty or non_null.std(ddof=0) == 0:
@@ -48,7 +56,15 @@ def detect_outliers_zscore(series: pd.Series, threshold: float = 3.0) -> pd.Seri
     return mask
 
 def detect_outliers_modified_zscore(series: pd.Series, threshold: float = 3.5) -> pd.Series:
-    """Boolean mask flagging Modified Z-score (MAD) outliers."""
+    """Boolean mask flagging Modified Z-score (MAD) outliers.
+
+    Args:
+        series (pd.Series): Input numeric series.
+        threshold (float): Modified Z-score threshold for outlier detection. Defaults to 3.5.
+
+    Returns:
+        pd.Series: Boolean mask aligned to series.index flagging outliers.
+    """
     median = series.median()
     clean = series.dropna()
     if clean.empty:

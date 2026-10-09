@@ -35,6 +35,16 @@ class TestEdaStatsComplete(unittest.TestCase):
         mask = detect_outliers_zscore(s, threshold=2.0)
         self.assertTrue(mask.iloc[5])
 
+    def test_detect_outliers_zscore_empty(self):
+        s = pd.Series([], dtype=float)
+        mask = detect_outliers_zscore(s)
+        self.assertTrue(mask.empty)
+
+    def test_detect_outliers_zscore_zero_std(self):
+        s = pd.Series([5, 5, 5, 5])
+        mask = detect_outliers_zscore(s)
+        self.assertFalse(mask.any())
+
     def test_detect_outliers_modified_zscore(self):
         s = pd.Series([10, 11, 10, 12, 11, 100])
         mask = detect_outliers_modified_zscore(s, threshold=3.5)

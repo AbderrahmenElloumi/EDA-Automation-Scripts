@@ -46,6 +46,8 @@ from eda_common import (
 from eda_stats import (
     iqr_bounds,
     iqr_outlier_mask,
+    detect_outliers_zscore,
+    detect_outliers_modified_zscore,
 )
 
 use_headless_backend_if_needed()
@@ -70,24 +72,11 @@ class OutlierSuite:
     def detect_iqr_outliers(self, column: str, multiplier: float = 1.5) -> pd.Series:
         return iqr_outlier_mask(self.df[column], multiplier)
 
-    def detect_zscore_outliers(self, column: str, threshold: float = 3) -> pd.Series:
-        series = self.df[column]
-        non_null = series.dropna()
-        mask = pd.Series(False, index=series.index)
-        if non_null.empty or non_null.std(ddof=0) == 0:
-            return mask
-        z_scores = np.abs(stats.zscore(non_null))
-        mask.loc[non_null.index] = z_scores > threshold
-        return mask
+    def detect_zscore_outliers(self, column: str, threshold: float = 3.0) -> pd.Series:
+        return detect_outliers_zscore(self.df[column], threshold)
 
     def detect_modified_zscore_outliers(self, column: str, threshold: float = 3.5) -> pd.Series:
-        series = self.df[column]
-        median = series.median()
-        mad = np.median(np.abs(series.dropna() - median))
-        if mad == 0:
-            return pd.Series(False, index=self.df.index)
-        modified_z = 0.6745 * (series - median) / mad
-        return (np.abs(modified_z) > threshold).fillna(False)
+        return detect_outliers_modified_zscore(self.df[column], threshold)
 
     def _fill_for_multivariate(self, cols: List[str]) -> pd.DataFrame:
         X = self.df[cols]
