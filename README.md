@@ -1,9 +1,10 @@
 # Original work credit goes to [balapriyac](https://github.com/balapriyac)
+
 ## This is an attempt at enhancing the scripts from [balapriyac/data-science-tuotrials/useful-python-scripts-eda](https://github.com/balapriyac/data-science-tutorials/tree/main/useful-python-scripts-eda) after running into some limitations while using them in my own EDA workflow.
 
-# EDA scripts — fixed versions (with the help of Claude Sonnet 5)
+# EDA scripts — fixed versions
 
-Corrected versions of the 5 scripts from `useful-python-scripts-eda`
+Adjusted versions of the 5 scripts from `useful-python-scripts-eda`
 (originally accompanying the KDnuggets article *"5 Useful Python
 Scripts to Automate Exploratory Data Analysis"*).
 
@@ -50,18 +51,17 @@ without sifting through a mixed pile of files.
 Every script accepts the same input options (via the shared
 `eda_common.py`):
 
-| Format | How to pass it | Notes |
-|---|---|---|
-| CSV | `script.py data.csv` | delimiter auto = `,`; override with `--delimiter` |
-| TSV / TXT | `script.py data.tsv` | delimiter auto = tab; override with `--delimiter` |
-| Excel | `script.py data.xlsx --sheet-name Sheet1` | `--sheet-name` accepts a name or a 0-based index |
-| Parquet | `script.py data.parquet` | — |
-| JSON | `script.py data.json --json-orient records` | `--json-orient` optional, forwarded to `pandas.read_json` |
-| XML | `script.py data.xml --xml-xpath ".//row"` | `--xml-xpath` optional, forwarded to `pandas.read_xml` |
-| Database | `script.py --db-uri sqlite:///data.db --db-table employees` | or `--db-query "SELECT ..."` instead of `--db-table`; any SQLAlchemy URI |
+| Format    | How to pass it                                                | Notes                                                                       |
+| --------- | ------------------------------------------------------------- | --------------------------------------------------------------------------- |
+| CSV       | `script.py data.csv`                                        | delimiter auto =`,`; override with `--delimiter`                        |
+| TSV / TXT | `script.py data.tsv`                                        | delimiter auto = tab; override with`--delimiter`                          |
+| Excel     | `script.py data.xlsx --sheet-name Sheet1`                   | `--sheet-name` accepts a name or a 0-based index                          |
+| Parquet   | `script.py data.parquet`                                    | —                                                                          |
+| JSON      | `script.py data.json --json-orient records`                 | `--json-orient` optional, forwarded to `pandas.read_json`               |
+| XML       | `script.py data.xml --xml-xpath ".//row"`                   | `--xml-xpath` optional, forwarded to `pandas.read_xml`                  |
+| Database  | `script.py --db-uri sqlite:///data.db --db-table employees` | or`--db-query "SELECT ..."` instead of `--db-table`; any SQLAlchemy URI |
 
-If the extension is ambiguous or missing, force it with `--format
-{csv,tsv,txt,excel,parquet,json,xml}`.
+If the extension is ambiguous or missing, force it with `--format {csv,tsv,txt,excel,parquet,json,xml}`.
 
 You can try to run any script with **no** input argument to try it against its
 built-in synthetic demo dataset.
@@ -113,26 +113,27 @@ under each one.
 
 **Shared options:**
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `input_path` (positional) | none | Path to the data file. Omit to use synthetic demo data. |
-| `--format` | auto-detected | Force `csv`/`tsv`/`txt`/`excel`/`parquet`/`json`/`xml` |
-| `--sheet-name` | `0` | Excel sheet name or index |
-| `--delimiter` | auto | Field delimiter for csv/tsv/txt |
-| `--json-orient` | none | Orient for `pandas.read_json` |
-| `--xml-xpath` | none | XPath for `pandas.read_xml` |
-| `--db-uri` | none | SQLAlchemy database URI |
-| `--db-table` | none | Table to read entirely (needs `--db-uri`) |
-| `--db-query` | none | Custom SQL query (needs `--db-uri`) |
-| `--no-auto-datetime` | off | Disable automatic date-column detection |
-| `--output-dir` | `eda_output` | Base folder; writes to `<dir>/plots/<script>/` and `<dir>/reports/<script>/` |
-| `--no-show` | off | Don't open interactive plot windows (still saves them) |
+| Flag                        | Default        | Meaning                                                                         |
+| --------------------------- | -------------- | ------------------------------------------------------------------------------- |
+| `input_path` (positional) | none           | Path to the data file. Omit to use synthetic demo data.                         |
+| `--format`                | auto-detected  | Force`csv`/`tsv`/`txt`/`excel`/`parquet`/`json`/`xml`             |
+| `--sheet-name`            | `0`          | Excel sheet name or index                                                       |
+| `--delimiter`             | auto           | Field delimiter for csv/tsv/txt                                                 |
+| `--json-orient`           | none           | Orient for`pandas.read_json`                                                  |
+| `--xml-xpath`             | none           | XPath for`pandas.read_xml`                                                    |
+| `--db-uri`                | none           | SQLAlchemy database URI                                                         |
+| `--db-table`              | none           | Table to read entirely (needs`--db-uri`)                                      |
+| `--db-query`              | none           | Custom SQL query (needs`--db-uri`)                                            |
+| `--no-auto-datetime`      | off            | Disable automatic date-column detection                                         |
+| `--output-dir`            | `eda_output` | Base folder; writes to`<dir>/plots/<script>/` and `<dir>/reports/<script>/` |
+| `--no-show`               | off            | Don't open interactive plot windows (still saves them)                          |
 
 ### `data_profiler.py`
 
 ```bash
 python data_profiler.py [input_path] [--high-cardinality-threshold 0.5] [shared options]
 ```
+
 - `--high-cardinality-threshold` (default `0.5`): fraction of unique
   values above which a categorical column is flagged high-cardinality.
 - Output: `reports/data_profiler/` only (numeric/categorical/datetime/
@@ -148,6 +149,7 @@ python data_profiler.py --db-uri sqlite:///hr.db --db-table employees --output-d
 ```bash
 python distribution_analyzer.py [input_path] [shared options]
 ```
+
 - No script-specific flags beyond the shared set.
 - Output: `reports/distribution_analyzer/` (numeric, categorical, and
   datetime distribution reports as CSV) and
@@ -164,6 +166,7 @@ python distribution_analyzer.py employees.csv --no-show --output-dir out
 ```bash
 python correlation_explorer.py [input_path] [--target COLUMN] [shared options]
 ```
+
 - `--target` (optional): numeric column to run mutual-information
   analysis against. If omitted, tries a column literally named
   `target`; otherwise mutual information is skipped.
@@ -178,11 +181,12 @@ python correlation_explorer.py sales.parquet --target revenue --output-dir out
 ```
 
 ### `outlier_suite.py`
- 
+
 ```bash
 python outlier_suite.py [input_path] [--consensus-min-methods 2] \
     [--treat-column COLUMN|all] [--treat-strategy {cap,remove,impute}] [shared options]
 ```
+
 - `--consensus-min-methods` (default `2`): how many of the 3 detectors
   (IQR, z-score, modified z-score) must flag a row for it to count as
   a "consensus" outlier.
@@ -202,10 +206,11 @@ python outlier_suite.py [input_path] [--consensus-min-methods 2] \
   `consensus_outliers_all_columns.png` (one subplot per column), or
   for a specific column, `outlier_comparison_<column>.png` — a
   detailed 4-method breakdown for just that column).
+
 ```bash
 python outlier_suite.py transactions.csv --treat-column all --treat-strategy impute --output-dir out
 ```
- 
+
 ```bash
 python outlier_suite.py transactions.json --treat-column amount --treat-strategy remove --output-dir out
 ```
@@ -215,6 +220,7 @@ python outlier_suite.py transactions.json --treat-column amount --treat-strategy
 ```bash
 python missing_data_analyzer.py [input_path] [--impute] [shared options]
 ```
+
 - `--impute` (flag, off by default): actually apply the recommended
   imputation strategy per column and write the resulting dataset.
 - Output: `reports/missing_data_analyzer/` (`missing_summary.csv`,
