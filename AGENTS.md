@@ -39,7 +39,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 - **No subagent retries.** If a subagent fails, abandon it and proceed directly.
 - **Confirm before host changes.** Ask before installing anything new on the host system or making system-level changes.
 - **Avoid Microsoft Store** for installations whenever possible.
-- **Ignore ./Playground directory** no matter what happens.
+- **Ignore ./Playground directory** no matter what happens. Never touch, reference, or output paths there.
 
 ## Gotchas
 
