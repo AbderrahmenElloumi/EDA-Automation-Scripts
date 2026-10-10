@@ -140,14 +140,27 @@ def use_headless_backend_if_needed() -> None:
         matplotlib.use("Agg")
 
 
-def finalize_plot(fig, out_path: Optional[str], show: bool, dpi: int = 150) -> None:
-    """Save a figure to disk and/or show it, then close it."""
+def finalize_plot(fig, out_path: Optional[str], show: bool, dpi: int = 150, metadata: Optional[Dict[str, Any]] = None) -> None:
+    """Save a figure to disk, log metadata JSON if provided, and/or show it, then close it."""
     import matplotlib.pyplot as plt
+    import json
+    import datetime
 
     if out_path:
-        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        p = Path(out_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
         log.info("Saved plot -> %s", out_path)
+
+        meta_dict = dict(metadata) if metadata else {}
+        meta_dict.setdefault("timestamp", datetime.datetime.now().isoformat())
+        meta_dict["plot_path"] = str(p.resolve())
+
+        meta_path = p.with_suffix(".json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta_dict, f, indent=2, default=str)
+        log.info("Saved plot metadata JSON -> %s", meta_path)
+
     if show:
         plt.show()
     plt.close(fig)
