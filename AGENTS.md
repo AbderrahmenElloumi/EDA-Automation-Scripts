@@ -28,6 +28,8 @@ For multi-step tasks, state a brief plan:
 
 Strong success criteria let you loop independently. Weak criteria ("make it work") require constant clarification.
 
+Every few turns, re-read the original request to make sure you haven't drifted from the goal.
+
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
@@ -35,7 +37,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ## Working Preferences
 
 - **Caveman normal mode.**
-- **Dev branch workflow.** All work happens on `dev`. Only merge to `main` with explicit user approval. Push to remote for both branches.
+- **Dev branch workflow.** All work happens on `dev`. Only merge to `main` with explicit user approval. Wait for approval before push.
 - **No subagent retries.** If a subagent fails, abandon it and proceed directly.
 - **Confirm before host changes.** Ask before installing anything new on the host system or making system-level changes.
 - **Avoid Microsoft Store** for installations whenever possible.
