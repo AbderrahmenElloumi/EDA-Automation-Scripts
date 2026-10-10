@@ -12,10 +12,6 @@ Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all o
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`while:
-- **Create a sub-issue**: `gh issue create --title "Sub-issue Title" --body "Description" --parent PARENT-ISSUE-NUMBER`
-- **Link an existing issue as a sub-issue**: `gh issue edit PARENT-ISSUE-NUMBER --add-sub-issue SUB-ISSUE-NUMBER`
-- **Create a sub-issue**: `gh issue create --title "Sub-issue Title" --body "Description" --parent PARENT-ISSUE-NUMBER`
-- **Link an existing issue as a sub-issue**: `gh issue edit PARENT-ISSUE-NUMBER --add-sub-issue SUB-ISSUE-NUMBER`
 
 1. Ticking boxes when completing acceptance criteria before closing issue/subissue. Serves as explicit verification trail.
 2. Removing ready-for-agent label when closing ticket or moving to done.
