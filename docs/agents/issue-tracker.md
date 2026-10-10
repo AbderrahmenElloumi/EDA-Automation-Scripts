@@ -1,15 +1,16 @@
+
 # Issue tracker: GitHub
 
 Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
 ## Conventions
 
-- **Create an issue**: `gh issue create --title "..." --body "..."`. Use a heredoc for multi-line bodies.
-- **Create a sub-issue**: `gh issue create --title "Sub-issue Title" --body "Description" --parent PARENT-ISSUE-NUMBER`
+- **Create an issue**: `gh issue create --title "..." --body "..."`. Use temp markdown file as body.
+- **Create a sub-issue**: `gh issue create --title "Sub-issue Title" --body "Description" --parent PARENT-ISSUE-NUMBER`. Use temp markdown file as body.
 - **Link an existing issue as a sub-issue**: `gh issue edit PARENT-ISSUE-NUMBER --add-sub-issue SUB-ISSUE-NUMBER`
 - **Read an issue**: `gh issue view <number> --comments`, filtering comments by `jq` and also fetching labels.
 - **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
-- **Comment on an issue**: `gh issue comment <number> --body "..."`
+- **Comment on an issue**: `gh issue comment <number> --body "..."`Use temp markdown file as body.
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
 - **Close**: `gh issue close <number> --comment "..."`while:
 
